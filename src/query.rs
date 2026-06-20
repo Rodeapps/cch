@@ -70,17 +70,33 @@ impl<'a> ElimTreeQuery<'a> {
         }
     }
 
-    /// Pin the target set. Idempotent within a query lifetime: call once after
-    /// construction and before issuing sources. To re-pin a different target
-    /// set, drop the query and create a new one.
+    /// Pin the target set. Call exactly once after construction and before
+    /// issuing sources.
+    ///
+    /// # Hard precondition: single call per query
+    ///
+    /// This must NOT be called twice on the same query. The
+    /// `in_backward_search_space` marks set during the ancestor walk below are
+    /// never reset over the query's lifetime (neither here nor in
+    /// [`Self::reset_source`]) — they define the static backward search-space
+    /// topology that bounds every later walk. A second `pin_targets` call would
+    /// see the first pin set's stale marks, terminate ancestor walks early, and
+    /// record wrong `target_elimination_tree_end` values, silently corrupting
+    /// all subsequent results. To pin a different target set, drop the query
+    /// and create a new one. Enforced by a hard (non-debug) assertion.
+    ///
+    /// # Panics
+    ///
+    /// Panics if called more than once on the same query (i.e. when a target
+    /// set has already been pinned).
     pub fn pin_targets(&mut self, targets: &[u32]) {
-        debug_assert!(
+        assert!(
             self.target_node.is_empty(),
-            "pin_targets called twice on the same query"
+            "pin_targets called twice on the same query: in_backward_search_space \
+             marks are never reset, so re-pinning would corrupt results; \
+             create a fresh ElimTreeQuery instead"
         );
 
-        self.target_node.clear();
-        self.target_elimination_tree_end.clear();
         self.target_node.reserve(targets.len());
         self.target_elimination_tree_end.reserve(targets.len());
 
@@ -269,23 +285,29 @@ mod tests {
     /// against the C++ oracle's `cch_compute_distance_matrix` for all pairs in
     /// a connected fixture graph.
     ///
-    /// Sentinel normalization: the oracle emits `u32::MAX` for unreachable
-    /// pairs; our function emits `INF_WEIGHT` (= `2_147_483_647` = `i32::MAX`).
-    /// We treat the two values as equivalent-unreachable. For all other
-    /// positions the values must be identical.
+    /// Sentinel normalization: our function emits `INF_WEIGHT`
+    /// (= `2_147_483_647` = `i32::MAX`) for unreachable pairs. The oracle's
+    /// `cch_compute_distance_matrix` emits the same `inf_weight` sentinel
+    /// (`2_147_483_647`); some `RoutingKit` paths use `u32::MAX` instead, so we
+    /// treat EITHER oracle sentinel as equivalent-unreachable. For all
+    /// reachable positions the values must be identical. The fixture's node 5
+    /// is isolated, so every ordered pair touching it (except 5→5) is
+    /// unreachable, exercising this normalization.
     #[test]
     fn distance_matrix_matches_cpp_oracle() {
         use routingkit_cch::ffi;
 
-        // Build a connected fixture: a bidirectional path 0-1-2-3-4 (9 arcs,
-        // both directions) so every pair is reachable and the comparison is
-        // purely about real distances.
+        // Build a fixture with one isolated node so the sentinel-normalization
+        // branch is actually exercised. Nodes 0-4 form a bidirectional path
+        // 0-1-2-3-4; node 5 is isolated (no incident arcs), so every ordered
+        // pair involving node 5 is unreachable → INF_WEIGHT on the Rust side,
+        // u32::MAX on the oracle side. (Node 5 → node 5 has distance 0.)
         //
-        // Arcs (in order):
+        // Arcs (in order), all among nodes 0-4:
         //   forward:  0→1, 1→2, 2→3, 3→4   (arcs 0-3)
         //   backward: 4→3, 3→2, 2→1, 1→0   (arcs 4-7)
         // Weights: arc index + 1, so weights = [1, 2, 3, 4, 5, 6, 7, 8].
-        let n: u32 = 5;
+        let n: u32 = 6;
         let tail: Vec<u32> = vec![0, 1, 2, 3, 4, 3, 2, 1];
         let head: Vec<u32> = vec![1, 2, 3, 4, 3, 2, 1, 0];
         let weights: Vec<u32> = (1..=8u32).collect();
@@ -340,8 +362,9 @@ mod tests {
         for k in 0..oracle_matrix.len() {
             let oracle_val = oracle_matrix[k];
             let rust_val = rust_matrix[k];
-            // Normalize sentinels: oracle uses u32::MAX, we use INF_WEIGHT.
-            let oracle_unreachable = oracle_val == u32::MAX;
+            // Normalize sentinels: oracle uses u32::MAX or inf_weight, we use
+            // INF_WEIGHT.
+            let oracle_unreachable = oracle_val == u32::MAX || oracle_val == INF_WEIGHT;
             let rust_unreachable = rust_val == INF_WEIGHT;
             assert_eq!(
                 oracle_unreachable,
