@@ -32,9 +32,12 @@ This crate provides, in pure Rust:
 ## Why
 
 Existing high-quality CCH implementations are C++ (notably
-[RoutingKit](https://github.com/RoutingKit/RoutingKit)). `cch` is a pure-Rust
-implementation — no C++ toolchain, no FFI — suitable for embedding in Rust
-services and reading bundles produced by the same crate.
+[RoutingKit](https://github.com/RoutingKit/RoutingKit)). `cch`'s published
+library has no C++ or FFI in its runtime dependencies, so downstream Rust
+services embed it without a C++ toolchain. A C++ RoutingKit oracle is used
+only as a dev-only differential-test dependency (not compiled by consumers).
+Today the crate reads pre-built bundles; pure-Rust bundle construction arrives
+in Phase 2.
 
 ## License
 
