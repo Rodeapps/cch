@@ -27,7 +27,7 @@ impl Graph {
     #[must_use]
     #[inline]
     pub fn node_count(&self) -> usize {
-        self.first_out.len().saturating_sub(1)
+        self.first_out.len() - 1
     }
 
     /// Returns the number of arcs in the graph.
