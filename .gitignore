@@ -3,3 +3,6 @@ Cargo.lock
 **/*.rs.bk
 *.pdb
 .DS_Store
+
+# Local-only design/plan docs (not part of the published crate)
+/.plans/
