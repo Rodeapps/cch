@@ -11,6 +11,7 @@ categories = ["algorithms", "science"]
 rust-version = "1.85"
 
 [dependencies]
+memmap2 = "0.9"
 
 [dev-dependencies]
 routingkit-cch = { path = "oracle/routingkit-cch" }
