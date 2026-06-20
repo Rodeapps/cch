@@ -290,10 +290,10 @@ impl MetricBundle {
         // mapping is live. We open read-only; production artifacts are
         // immutable.
         let mmap = unsafe { memmap2::Mmap::map(&file)? };
-        if mmap.len() < 24 {
+        if mmap.len() < 32 {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
-                "metric bundle too small",
+                "metric bundle too small to contain header",
             ));
         }
         let bytes = &mmap[..];
@@ -315,10 +315,22 @@ impl MetricBundle {
 
         // Header (24 bytes), then 2 sections each [u64 byte_length][bytes...].
         let mut pos = 24usize;
+        if pos + 8 > bytes.len() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "truncated metric bundle at forward section",
+            ));
+        }
         let forward_len = read_u64_le_at(bytes, pos) as usize;
         pos += 8;
         let forward_off = pos;
         pos += forward_len;
+        if pos + 8 > bytes.len() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "truncated metric bundle at backward section",
+            ));
+        }
         let backward_len = read_u64_le_at(bytes, pos) as usize;
         pos += 8;
         let backward_off = pos;
@@ -457,5 +469,65 @@ mod tests {
                 .collect();
             assert_eq!(down_nbrs, up_into_y, "transpose mismatch at node {y}");
         }
+    }
+
+    #[test]
+    fn opens_metric_bundle() {
+        use routingkit_cch::ffi;
+
+        // Build a small path graph: 0→1→2→3→4 (5 nodes, 4 arcs).
+        let n: u32 = 5;
+        let order: Vec<u32> = (0..n).collect();
+        let tail: Vec<u32> = (0..n - 1).collect();
+        let head: Vec<u32> = (1..n).collect();
+
+        let cch = unsafe { ffi::cch_new(&order, &tail, &head, |_| {}, false) };
+        let cch_ref = cch.as_ref().expect("cch_new returned null");
+
+        let dir = tempfile::tempdir().expect("tempdir");
+
+        // Save struct bundle so we can cross-check the CCH arc count.
+        let struct_path = dir.path().join("tiny.cch-struct");
+        let struct_path_str = struct_path.to_str().expect("path is valid UTF-8");
+        unsafe { ffi::cch_save_struct(cch_ref, struct_path_str) }
+            .expect("cch_save_struct failed");
+        let struct_bundle = CchBundle::open(&struct_path).expect("CchBundle::open failed");
+        let expected_arc_count = struct_bundle.view().up_head.len();
+
+        // Build and customize a metric; weights = arc index (one per input arc).
+        #[allow(clippy::cast_possible_truncation)] // tail.len() is tiny (4) in this test
+        let weights: Vec<u32> = (0..tail.len() as u32).collect();
+        let mut metric =
+            unsafe { ffi::cch_metric_new(cch_ref, &weights) };
+        unsafe { ffi::cch_metric_customize(metric.as_mut().expect("metric pin")) };
+
+        // Save the metric bundle.
+        let metric_path = dir.path().join("tiny.cch-metric");
+        let metric_path_str = metric_path.to_str().expect("path is valid UTF-8");
+        unsafe { ffi::cch_save_metric(metric.as_ref().expect("metric ref"), metric_path_str) }
+            .expect("cch_save_metric failed");
+
+        // Re-open with our mmap reader.
+        let mbundle = MetricBundle::open(&metric_path).expect("MetricBundle::open failed");
+        let mv = mbundle.view();
+
+        // forward and backward arrays must be the same length.
+        assert_eq!(mv.forward.len(), mv.backward.len());
+
+        // Both must equal the CCH arc count from the struct bundle.
+        assert!(
+            !mv.forward.is_empty(),
+            "metric forward array must be non-empty"
+        );
+        assert_eq!(
+            mv.forward.len(),
+            expected_arc_count,
+            "metric forward len should match CCH arc count"
+        );
+        assert_eq!(
+            mv.backward.len(),
+            expected_arc_count,
+            "metric backward len should match CCH arc count"
+        );
     }
 }
