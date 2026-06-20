@@ -12,6 +12,10 @@ rust-version = "1.85"
 
 [dependencies]
 
+[dev-dependencies]
+routingkit-cch = { path = "oracle/routingkit-cch" }
+tempfile = "3"
+
 [lints.clippy]
 all = "deny"
 pedantic = "warn"

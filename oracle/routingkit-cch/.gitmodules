@@ -1,0 +1,3 @@
+[submodule "RoutingKit"]
+	path = RoutingKit
+	url = https://github.com/RoutingKit/RoutingKit

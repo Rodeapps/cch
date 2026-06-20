@@ -1,0 +1,98 @@
+language: cpp
+
+sudo: required
+dist: trusty
+
+env:
+  global:
+    - OMP_NUM_THREADS=4
+    - GLOBAL_CFLAGS="-std=c++11 -Iinclude -fPIC"
+
+matrix:
+  include:
+    - os: linux
+      env: MY_CXX="g++" OMP_LDFLAGS="-fopenmp" CFLAGS="-O3 -march=native"
+    - os: linux
+      env: MY_CXX="g++" OMP_LDFLAGS="-fopenmp" CFLAGS="-O3 -march=native -ffast-math"
+    - os: linux
+      env: MY_CXX="g++" OMP_LDFLAGS="-fopenmp" CFLAGS="-O3 -march=native -ffast-math -DNDEBUG"
+    - os: linux
+      env: MY_CXX="g++" OMP_LDFLAGS="-fopenmp" CFLAGS="-O3 -march=native -ffast-math -DROUTING_KIT_NO_GCC_EXTENSIONS -DROUTING_KIT_NO_POSIX"
+    - os: linux
+      addons: &clang5
+        apt:
+          sources:
+            - llvm-toolchain-trusty-5.0
+          packages:
+            - clang-5.0
+            - libiomp-dev
+            - libiomp5
+      env: MY_CXX="clang++-5.0" OMP_LDFLAGS="-fopenmp=libiomp5" CFLAGS="-O3 -march=native -ffast-math"
+    - os: linux
+      addons: *clang5
+      env: MY_CXX="clang++-5.0" OMP_LDFLAGS="-fopenmp=libiomp5" CFLAGS="-O3 -march=native -ffast-math -DNDEBUG -fsanitize=address -fno-omit-frame-pointer" LDFLAGS="-fsanitize=address"
+    # Memory Sanitizer is deactivated because it is broken in the used Clang version.
+    # The current version finds a use-of-uninitialized-value in the following simple code:
+    #
+    # #include <exception>
+    # #include <iostream>
+    # using namespace std;
+    #
+    # int main(){
+    #   std::exception_ptr p;
+    #   p = nullptr;
+    #   if(p){
+    #     cout << "???" << endl;
+    #   }
+    # }
+    #
+    # It is compiled using:
+    # clang++-5.0 -std=c++11 -fsanitize=memory foo.cpp -o foo && ./foo
+    #
+    # - os: linux
+    #   addons: *clang5
+    #   env: MY_CXX="clang++-5.0" OMP_LDFLAGS="-fopenmp=libiomp5" CFLAGS="-O3 -march=native -ffast-math -DNDEBUG -fsanitize=memory -fno-omit-frame-pointer" LDFLAGS="-fsanitize=memory"
+    - os: linux
+      addons: *clang5
+      env: MY_CXX="clang++-5.0" OMP_LDFLAGS="-fopenmp=libiomp5" CFLAGS="-O3 -march=native -ffast-math -DNDEBUG -fsanitize=undefined -fno-omit-frame-pointer" LDFLAGS="-fsanitize=undefined"
+
+before_script:
+  - echo MY_CXX=$MY_CXX
+  - echo GLOBAL_CFLAGS=$GLOBAL_CFLAGS
+  - echo CFLAGS=CFLAGS
+  - echo LDFLAGS=LDFLAGS
+  - echo OMP_LDFLAGS=OMP_LDFLAGS
+  - $MY_CXX --version
+  - make CC="$MY_CXX" CFLAGS="$GLOBAL_CFLAGS $CFLAGS" LDFLAGS="$LDFLAGS" OMP_LDFLAGS="$OMP_LDFLAGS" -j2
+  - git clone https://github.com/RoutingKit/DataForAutomaticTests.git data
+
+script:
+  - bin/test_bit_vector
+  - bin/test_buffered_asynchronous_reader
+  - bin/test_geo_dist
+  - bin/test_id_mapper
+  - bin/test_id_set_queue
+  - bin/test_inverse_vector
+  - bin/test_nearest_neighbor
+  - bin/test_nested_dissection
+  - bin/test_permutation
+  - bin/test_protobuf
+  - bin/test_sort
+  - bin/test_tag_map
+  - bin/test_strongly_connected_component
+  - bin/test_customizable_contraction_hierarchy_reset
+  - bin/test_osm_simple data/luxembourg.pbf
+  - bin/test_dijkstra data/luxembourg_first_out data/luxembourg_head data/luxembourg_travel_time
+  - bin/test_contraction_hierarchy_extra_weight data/luxembourg_first_out data/luxembourg_head data/luxembourg_travel_time data/luxembourg_geo_distance
+  - bin/test_contraction_hierarchy_path_query data/luxembourg_first_out data/luxembourg_head data/luxembourg_travel_time data/luxembourg_travel_time_ch data/luxembourg_source_node data/luxembourg_target_node data/luxembourg_query_reference_travel_time_length
+  - bin/test_contraction_hierarchy_path_query data/luxembourg_first_out data/luxembourg_head data/luxembourg_geo_distance data/luxembourg_geo_distance_ch data/luxembourg_source_node data/luxembourg_target_node data/luxembourg_query_reference_geo_distance_length
+  - bin/test_contraction_hierarchy_pinned_query data/luxembourg_travel_time_ch
+  - bin/test_contraction_hierarchy_pinned_query data/luxembourg_geo_distance_ch
+  - bin/test_customizable_contraction_hierarchy data/luxembourg_first_out data/luxembourg_head data/luxembourg_cch_order
+  - bin/test_customizable_contraction_hierarchy_path_query data/luxembourg_first_out data/luxembourg_head data/luxembourg_travel_time data/luxembourg_cch_order data/luxembourg_source_node data/luxembourg_target_node data/luxembourg_query_reference_travel_time_length
+  - bin/test_customizable_contraction_hierarchy_path_query data/luxembourg_first_out data/luxembourg_head data/luxembourg_geo_distance data/luxembourg_cch_order data/luxembourg_source_node data/luxembourg_target_node data/luxembourg_query_reference_geo_distance_length
+  - bin/test_customizable_contraction_hierarchy_perfect_customization data/luxembourg_first_out data/luxembourg_head data/luxembourg_travel_time data/luxembourg_cch_order data/luxembourg_source_node data/luxembourg_target_node data/luxembourg_query_reference_travel_time_length
+  - bin/test_customizable_contraction_hierarchy_perfect_customization data/luxembourg_first_out data/luxembourg_head data/luxembourg_geo_distance data/luxembourg_cch_order data/luxembourg_source_node data/luxembourg_target_node data/luxembourg_query_reference_geo_distance_length
+  - bin/test_customizable_contraction_hierarchy_pinned_query data/luxembourg_first_out data/luxembourg_head data/luxembourg_travel_time data/luxembourg_cch_order
+  - bin/test_customizable_contraction_hierarchy_pinned_query data/luxembourg_first_out data/luxembourg_head data/luxembourg_geo_distance data/luxembourg_cch_order
+  - bin/test_basic_features data/luxembourg.pbf
