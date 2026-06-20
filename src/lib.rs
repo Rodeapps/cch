@@ -22,4 +22,5 @@ pub const INF_WEIGHT: u32 = 2_147_483_647;
 
 pub mod bundle;
 pub mod graph;
+pub mod path;
 pub mod query;
