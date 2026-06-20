@@ -1,0 +1,17 @@
+[package]
+name = "cch"
+version = "0.0.0"
+edition = "2024"
+license = "MIT"
+description = "Pure-Rust Customizable Contraction Hierarchies (CCH) for fast road routing"
+repository = "https://github.com/Rodeapps/cch"
+readme = "README.md"
+keywords = ["routing", "cch", "contraction-hierarchies", "shortest-path", "graph"]
+categories = ["algorithms", "science"]
+rust-version = "1.85"
+
+[dependencies]
+
+[lints.clippy]
+all = "deny"
+pedantic = "warn"
