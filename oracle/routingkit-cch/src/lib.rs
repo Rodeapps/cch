@@ -543,7 +543,7 @@ impl<'b, 'a> Drop for CCHQueryResult<'b, 'a> {
 }
 
 pub mod many_to_many;
-pub use many_to_many::{distance_matrix, UNREACHABLE};
+pub use many_to_many::{UNREACHABLE, distance_matrix};
 
 #[cfg(feature = "pyo3")]
 mod python_binding;

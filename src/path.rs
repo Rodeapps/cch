@@ -11,8 +11,8 @@
 //! the FIRST witness, matching routingkit's `unpack_forward_arc` /
 //! `unpack_backward_arc`.
 
-use crate::bundle::{CchView, MetricView, INVALID_ID};
 use crate::INF_WEIGHT;
+use crate::bundle::{CchView, INVALID_ID, MetricView};
 
 // ---------------------------------------------------------------------------
 // Internal helpers
@@ -62,8 +62,14 @@ fn unpack_arc(
 ) {
     // Merge-join over the down-neighbour lists of x and y to find common
     // lower neighbours (the lower triangle of arc x→y).
-    let (mut a, ae) = (cch.down_first_out[x as usize], cch.down_first_out[x as usize + 1]);
-    let (mut b, be) = (cch.down_first_out[y as usize], cch.down_first_out[y as usize + 1]);
+    let (mut a, ae) = (
+        cch.down_first_out[x as usize],
+        cch.down_first_out[x as usize + 1],
+    );
+    let (mut b, be) = (
+        cch.down_first_out[y as usize],
+        cch.down_first_out[y as usize + 1],
+    );
     while a != ae && b != be {
         let hx = cch.down_head[a as usize];
         let hy = cch.down_head[b as usize];
@@ -137,12 +143,7 @@ fn unpack_arc(
 #[allow(clippy::too_many_lines)] // faithful port of routingkit's path query — splitting obscures algorithm
 #[allow(clippy::many_single_char_names)] // s,t,n,x,y,l: conventional rank-space node variables
 #[allow(clippy::cast_possible_truncation)] // v < node_count ≤ u32::MAX by CCH invariant
-pub fn node_path(
-    cch: &CchView,
-    metric: &MetricView,
-    source: u32,
-    target: u32,
-) -> Option<Vec<u32>> {
+pub fn node_path(cch: &CchView, metric: &MetricView, source: u32, target: u32) -> Option<Vec<u32>> {
     if source == target {
         return Some(vec![source]);
     }

@@ -237,7 +237,10 @@ impl CchBundle {
                     self.cch_arc_count,
                 ),
                 down_first_out: std::slice::from_raw_parts(
-                    self.mmap.as_ptr().add(self.down_first_out_off).cast::<u32>(),
+                    self.mmap
+                        .as_ptr()
+                        .add(self.down_first_out_off)
+                        .cast::<u32>(),
                     self.node_count + 1,
                 ),
                 down_head: std::slice::from_raw_parts(
@@ -432,8 +435,7 @@ mod tests {
         let path = dir.path().join("tiny.cch-struct");
         let path_str = path.to_str().expect("path is valid UTF-8");
 
-        unsafe { ffi::cch_save_struct(cch_ref, path_str) }
-            .expect("cch_save_struct failed");
+        unsafe { ffi::cch_save_struct(cch_ref, path_str) }.expect("cch_save_struct failed");
 
         // Re-open with our mmap reader.
         let bundle = CchBundle::open(&path).expect("CchBundle::open failed");
@@ -489,16 +491,14 @@ mod tests {
         // Save struct bundle so we can cross-check the CCH arc count.
         let struct_path = dir.path().join("tiny.cch-struct");
         let struct_path_str = struct_path.to_str().expect("path is valid UTF-8");
-        unsafe { ffi::cch_save_struct(cch_ref, struct_path_str) }
-            .expect("cch_save_struct failed");
+        unsafe { ffi::cch_save_struct(cch_ref, struct_path_str) }.expect("cch_save_struct failed");
         let struct_bundle = CchBundle::open(&struct_path).expect("CchBundle::open failed");
         let expected_arc_count = struct_bundle.view().up_head.len();
 
         // Build and customize a metric; weights = arc index (one per input arc).
         #[allow(clippy::cast_possible_truncation)] // tail.len() is tiny (4) in this test
         let weights: Vec<u32> = (0..tail.len() as u32).collect();
-        let mut metric =
-            unsafe { ffi::cch_metric_new(cch_ref, &weights) };
+        let mut metric = unsafe { ffi::cch_metric_new(cch_ref, &weights) };
         unsafe { ffi::cch_metric_customize(metric.as_mut().expect("metric pin")) };
 
         // Save the metric bundle.

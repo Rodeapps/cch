@@ -1,11 +1,16 @@
 //! # cch
 //!
 //! Pure-Rust **Customizable Contraction Hierarchies** (CCH) for fast road routing:
-//! build a contraction order, contract to a CCH structure, customize per metric,
-//! and answer shortest-path distance / distance-matrix queries with shortcut
-//! path-unpacking — over mmappable, zero-copy bundles.
+//! read mmappable, zero-copy bundles and answer shortest-path distance /
+//! distance-matrix queries with shortcut path-unpacking.
 //!
-//! Status: early development. See the design spec and README for the planned API.
+//! **Phase 1 (implemented):** query/serve over pre-built bundles — open a
+//! `.cch-struct` + `.cch-metric`, run distance-matrix or node-path queries.
+//! Bundles must be pre-built by an external tool (e.g. `RoutingKit` or the
+//! rapidonkey engine) until Phase 2 adds pure-Rust construction.
+//!
+//! **Phase 2 (planned):** pure-Rust bundle construction — contraction order,
+//! CCH structure, per-metric customization, and a bundle writer.
 //!
 //! Derives from [RoutingKit](https://github.com/RoutingKit/RoutingKit) (BSD-2-Clause);
 //! see `NOTICE`.
@@ -24,3 +29,7 @@ pub mod bundle;
 pub mod graph;
 pub mod path;
 pub mod query;
+
+pub use bundle::{CchBundle, CchView, MetricBundle, MetricView};
+pub use path::node_path;
+pub use query::distance_matrix;

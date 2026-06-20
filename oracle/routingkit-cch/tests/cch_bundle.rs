@@ -5,7 +5,7 @@
 //! the original in-memory CCH/metric. Uses a tiny synthetic 10-node graph
 //! so the test runs in <1 s and doesn't need shapefile fixtures.
 
-use routingkit_cch::{ffi, CCHMetric, CCH};
+use routingkit_cch::{CCH, CCHMetric, ffi};
 use tempfile::TempDir;
 
 /// Build a tiny 10-node directed graph:
@@ -20,8 +20,12 @@ fn tiny_graph() -> (Vec<u32>, Vec<u32>, Vec<u32>) {
         head.push(i + 1);
         weight.push(10);
     }
-    tail.push(9); head.push(0); weight.push(10);
-    tail.push(0); head.push(5); weight.push(100); // long shortcut
+    tail.push(9);
+    head.push(0);
+    weight.push(10);
+    tail.push(0);
+    head.push(5);
+    weight.push(100); // long shortcut
     (tail, head, weight)
 }
 
@@ -36,10 +40,8 @@ fn roundtrip_struct_only() {
     let path_str = path.to_str().unwrap();
 
     // Save + reload.
-    unsafe { ffi::cch_save_struct(cch.inner_ref(), path_str) }
-        .expect("save_struct");
-    let _loaded = unsafe { ffi::cch_load_struct(path_str) }
-        .expect("load_struct");
+    unsafe { ffi::cch_save_struct(cch.inner_ref(), path_str) }.expect("save_struct");
+    let _loaded = unsafe { ffi::cch_load_struct(path_str) }.expect("load_struct");
     // Just verify it loads without error; field-equivalence is implicit
     // in the query equivalence test below.
 }
@@ -62,9 +64,8 @@ fn roundtrip_struct_and_metric_query_equivalent() {
             .expect("save_metric");
     }
 
-    let cch_loaded_ptr = unsafe {
-        ffi::cch_load_struct(struct_path.to_str().unwrap()).expect("load_struct")
-    };
+    let cch_loaded_ptr =
+        unsafe { ffi::cch_load_struct(struct_path.to_str().unwrap()).expect("load_struct") };
     let cch_loaded = CCH::from_unique_ptr(cch_loaded_ptr);
     let metric_loaded_ptr = unsafe {
         ffi::cch_load_metric(cch_loaded.inner_ref(), metric_path.to_str().unwrap())
@@ -77,7 +78,10 @@ fn roundtrip_struct_and_metric_query_equivalent() {
     let m_orig = routingkit_cch::distance_matrix(&metric_orig, &nodes, &nodes);
     let m_loaded = routingkit_cch::distance_matrix(&metric_loaded, &nodes, &nodes);
 
-    assert_eq!(m_orig, m_loaded, "loaded-bundle metric must produce identical distances");
+    assert_eq!(
+        m_orig, m_loaded,
+        "loaded-bundle metric must produce identical distances"
+    );
 }
 
 #[test]
@@ -109,8 +113,7 @@ fn load_metric_arc_count_mismatch_errors() {
     let small_order = vec![0u32, 1];
     let small_cch = CCH::new(&small_order, &small_tail, &small_head, |_| {}, false);
 
-    let result = unsafe {
-        ffi::cch_load_metric(small_cch.inner_ref(), metric_path.to_str().unwrap())
-    };
+    let result =
+        unsafe { ffi::cch_load_metric(small_cch.inner_ref(), metric_path.to_str().unwrap()) };
     assert!(result.is_err(), "arc-count mismatch must error");
 }

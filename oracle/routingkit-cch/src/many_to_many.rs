@@ -2,8 +2,8 @@
 //! function. Calls the C++ implementation in `routingkit_cch_wrapper.cc`
 //! through the `ffi::cch_compute_distance_matrix` bridge.
 
-use crate::ffi;
 use crate::CCHMetric;
+use crate::ffi;
 
 /// Distance value used when a target is unreachable from a given source.
 /// Mirrors RoutingKit's `inf_weight` convention.

@@ -3,8 +3,8 @@
 //! Ported from `native/routing-core/src/cch_mmap.rs` in rapidonkey
 //! (`ElimTreeQuery` + `distance_matrix_mmap`).
 
-use crate::bundle::{CchView, MetricView, INVALID_ID};
 use crate::INF_WEIGHT;
+use crate::bundle::{CchView, INVALID_ID, MetricView};
 
 // ---------------------------------------------------------------------------
 // ElimTreeQuery
@@ -299,8 +299,7 @@ mod tests {
         let metric_path = dir.path().join("dm.cch-metric");
 
         unsafe {
-            ffi::cch_save_struct(cch_ref, struct_path.to_str().unwrap())
-                .expect("cch_save_struct");
+            ffi::cch_save_struct(cch_ref, struct_path.to_str().unwrap()).expect("cch_save_struct");
         }
 
         let oracle_matrix = unsafe {
@@ -313,14 +312,16 @@ mod tests {
                 &sources,
                 &targets,
             );
-            ffi::cch_save_metric(metric.as_ref().expect("metric ref"), metric_path.to_str().unwrap())
-                .expect("cch_save_metric");
+            ffi::cch_save_metric(
+                metric.as_ref().expect("metric ref"),
+                metric_path.to_str().unwrap(),
+            )
+            .expect("cch_save_metric");
             matrix
         };
 
         // Re-open via our mmap readers and run our pure-Rust distance_matrix.
-        let cch_bundle =
-            crate::bundle::CchBundle::open(&struct_path).expect("CchBundle::open");
+        let cch_bundle = crate::bundle::CchBundle::open(&struct_path).expect("CchBundle::open");
         let metric_bundle =
             crate::bundle::MetricBundle::open(&metric_path).expect("MetricBundle::open");
         let cch_view = cch_bundle.view();
@@ -351,7 +352,8 @@ mod tests {
             );
             if !oracle_unreachable && !rust_unreachable {
                 assert_eq!(
-                    oracle_val, rust_val,
+                    oracle_val,
+                    rust_val,
                     "distance mismatch at index {k} (i={}, j={}): oracle={oracle_val}, rust={rust_val}",
                     k / (n as usize),
                     k % (n as usize),
