@@ -82,8 +82,7 @@ fn main() {
     // ----------------------------------------------------------------
     let cch = cch::Cch::build(&graph, &order);
     println!(
-        "CCH built: {} CCH arcs ({}× expansion over {} input arcs)",
-        cch.cch_arc_count(),
+        "CCH built: {} CCH arcs (from {} input arcs)",
         cch.cch_arc_count(),
         graph.arc_count(),
     );
