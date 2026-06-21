@@ -59,6 +59,36 @@ pub struct Cch {
     /// Maps a down-arc index to its corresponding up-arc index.
     /// Length = `cch_arc_count`.
     pub down_to_up: Vec<u32>,
+
+    // ---- Part A: input-arc → CCH-arc mapping (weight-independent) ----
+    /// For each INPUT arc (in the order `Cch::build` derives them from the CSR
+    /// graph), the CCH up-arc id it maps to, or [`INVALID_ID`] for a self-loop.
+    /// Length = `input_arc_count`. Ports C++ `input_arc_to_cch_arc`.
+    pub input_arc_to_cch_arc: Vec<u32>,
+    /// Per CCH arc, the input arc whose weight initializes its FORWARD weight,
+    /// or [`INVALID_ID`] if none. Length = `cch_arc_count`. Ports the (flattened)
+    /// C++ `forward_input_arc_of_cch` — the "first" input arc per CCH arc.
+    pub forward_input_arc_of_cch: Vec<u32>,
+    /// Per CCH arc, the input arc whose weight initializes its BACKWARD weight,
+    /// or [`INVALID_ID`] if none. Length = `cch_arc_count`. Ports the (flattened)
+    /// C++ `backward_input_arc_of_cch`.
+    pub backward_input_arc_of_cch: Vec<u32>,
+    /// CSR row-pointers into [`Self::extra_forward_input_arc_of_cch`], one per
+    /// CCH arc (+1). Entry `i..i+1` is the range of EXTRA forward input arcs
+    /// (parallel arcs beyond the first) mapping to CCH arc `i`. Length =
+    /// `cch_arc_count + 1`. Ports C++ `first_extra_forward_input_arc_of_cch`.
+    pub first_extra_forward_input_arc_of_cch: Vec<u32>,
+    /// Flat list of extra (parallel) forward input arcs, grouped by CCH arc per
+    /// [`Self::first_extra_forward_input_arc_of_cch`]. Ports C++
+    /// `extra_forward_input_arc_of_cch`.
+    pub extra_forward_input_arc_of_cch: Vec<u32>,
+    /// CSR row-pointers into [`Self::extra_backward_input_arc_of_cch`], one per
+    /// CCH arc (+1). Length = `cch_arc_count + 1`. Ports C++
+    /// `first_extra_backward_input_arc_of_cch`.
+    pub first_extra_backward_input_arc_of_cch: Vec<u32>,
+    /// Flat list of extra (parallel) backward input arcs. Ports C++
+    /// `extra_backward_input_arc_of_cch`.
+    pub extra_backward_input_arc_of_cch: Vec<u32>,
 }
 
 impl Cch {
@@ -100,17 +130,22 @@ impl Cch {
 
         // Derive (tail, head) from the CSR graph, then relabel endpoints by
         // rank (C++ lines 228–229: apply_permutation_to_elements_of(rank, …)).
+        // We keep the rank-relabeled endpoints in their ORIGINAL (input-arc-id)
+        // order in `orig_tail`/`orig_head` for the Part-A mapping, and a working
+        // copy `input_tail`/`input_head` that gets sorted for structure building.
         let input_arc_count = graph.arc_count();
-        let mut input_tail = Vec::with_capacity(input_arc_count);
-        let mut input_head = Vec::with_capacity(input_arc_count);
+        let mut orig_tail = Vec::with_capacity(input_arc_count);
+        let mut orig_head = Vec::with_capacity(input_arc_count);
         for v in 0..node_count {
             let start = graph.first_out[v] as usize;
             let end = graph.first_out[v + 1] as usize;
             for arc in start..end {
-                input_tail.push(rank[v]);
-                input_head.push(rank[graph.head[arc] as usize]);
+                orig_tail.push(rank[v]);
+                orig_head.push(rank[graph.head[arc] as usize]);
             }
         }
+        let mut input_tail = orig_tail.clone();
+        let mut input_head = orig_head.clone();
 
         // C++ lines 243–246: sort arcs first-by-tail-then-by-head.
         sort_by_tail_then_head(node_count, &mut input_tail, &mut input_head);
@@ -128,6 +163,9 @@ impl Cch {
 
         // C++ line 314: up_first_out = invert_vector(up_tail, node_count).
         let up_first_out = invert_vector(&up_tail, node_count);
+
+        // Part A — input-arc → CCH-arc mapping (C++ lines 325–376, 555–640).
+        let mapping = build_input_arc_mapping(&orig_tail, &orig_head, &up_first_out, &up_head);
 
         // C++ lines 390–396: elimination tree parent.
         let mut elimination_tree_parent = vec![0u32; node_count];
@@ -162,8 +200,146 @@ impl Cch {
             down_first_out,
             down_head,
             down_to_up,
+            input_arc_to_cch_arc: mapping.input_arc_to_cch_arc,
+            forward_input_arc_of_cch: mapping.forward_input_arc_of_cch,
+            backward_input_arc_of_cch: mapping.backward_input_arc_of_cch,
+            first_extra_forward_input_arc_of_cch: mapping.first_extra_forward_input_arc_of_cch,
+            extra_forward_input_arc_of_cch: mapping.extra_forward_input_arc_of_cch,
+            first_extra_backward_input_arc_of_cch: mapping.first_extra_backward_input_arc_of_cch,
+            extra_backward_input_arc_of_cch: mapping.extra_backward_input_arc_of_cch,
         }
     }
+}
+
+/// Result of [`build_input_arc_mapping`] — the Part-A input-arc → CCH-arc maps.
+struct InputArcMapping {
+    input_arc_to_cch_arc: Vec<u32>,
+    forward_input_arc_of_cch: Vec<u32>,
+    backward_input_arc_of_cch: Vec<u32>,
+    first_extra_forward_input_arc_of_cch: Vec<u32>,
+    extra_forward_input_arc_of_cch: Vec<u32>,
+    first_extra_backward_input_arc_of_cch: Vec<u32>,
+    extra_backward_input_arc_of_cch: Vec<u32>,
+}
+
+/// Builds the input-arc → CCH-arc mapping (C++ lines 325–376 + 555–640).
+///
+/// `orig_tail`/`orig_head` are the rank-relabeled input-arc endpoints in their
+/// ORIGINAL input-arc-id order. `up_first_out`/`up_head` describe the (sorted)
+/// CCH up-graph.
+///
+/// For each input arc with relabeled endpoints `(t, h)`:
+/// * `t == h` → self-loop → maps to [`INVALID_ID`] (C++ 351–353).
+/// * `t < h`  → UPWARD arc; maps to the up-arc `(t, h)`; its weight initializes
+///   that CCH arc's FORWARD weight (C++ 342–350, 579).
+/// * `t > h`  → DOWNWARD arc; maps to the up-arc `(h, t)`; its weight
+///   initializes that CCH arc's BACKWARD weight (C++ 357–375, 588).
+///
+/// The first input arc seen for a (CCH arc, direction) becomes
+/// `forward/backward_input_arc_of_cch`; any further (parallel) input arcs go
+/// into the `extra_*` CSR lists, so `customize`'s reset can take the min over
+/// all of them (parallel-arc minimum). C++ separates first vs. extra at lines
+/// 580–596; the inverse-permutation reordering at 603–636 merely groups the
+/// extra lists by CCH arc, which the CSR layout built here reproduces directly.
+fn build_input_arc_mapping(
+    orig_tail: &[u32],
+    orig_head: &[u32],
+    up_first_out: &[u32],
+    up_head: &[u32],
+) -> InputArcMapping {
+    let input_arc_count = orig_tail.len();
+    let cch_arc_count = up_head.len();
+
+    let mut input_arc_to_cch_arc = vec![INVALID_ID; input_arc_count];
+    let mut forward_input_arc_of_cch = vec![INVALID_ID; cch_arc_count];
+    let mut backward_input_arc_of_cch = vec![INVALID_ID; cch_arc_count];
+
+    // Per-CCH-arc accumulators for parallel (extra) input arcs.
+    let mut extra_forward: Vec<Vec<u32>> = vec![Vec::new(); cch_arc_count];
+    let mut extra_backward: Vec<Vec<u32>> = vec![Vec::new(); cch_arc_count];
+
+    for input_arc in 0..input_arc_count {
+        let t = orig_tail[input_arc];
+        let h = orig_head[input_arc];
+        if t == h {
+            continue; // self-loop → INVALID_ID (already initialized)
+        }
+        let upward = t < h;
+        let (lo, hi) = if upward { (t, h) } else { (h, t) };
+        let cch_arc = find_up_arc(up_first_out, up_head, lo, hi);
+        #[allow(
+            clippy::cast_possible_truncation,
+            reason = "input_arc < input_arc_count <= u32::MAX (CCH limit)"
+        )]
+        let input_arc_u32 = input_arc as u32;
+        input_arc_to_cch_arc[input_arc] = cch_arc;
+        let ci = cch_arc as usize;
+        if upward {
+            if forward_input_arc_of_cch[ci] == INVALID_ID {
+                forward_input_arc_of_cch[ci] = input_arc_u32;
+            } else {
+                extra_forward[ci].push(input_arc_u32);
+            }
+        } else if backward_input_arc_of_cch[ci] == INVALID_ID {
+            backward_input_arc_of_cch[ci] = input_arc_u32;
+        } else {
+            extra_backward[ci].push(input_arc_u32);
+        }
+    }
+
+    let (first_extra_forward_input_arc_of_cch, extra_forward_input_arc_of_cch) =
+        flatten_extra(&extra_forward);
+    let (first_extra_backward_input_arc_of_cch, extra_backward_input_arc_of_cch) =
+        flatten_extra(&extra_backward);
+
+    InputArcMapping {
+        input_arc_to_cch_arc,
+        forward_input_arc_of_cch,
+        backward_input_arc_of_cch,
+        first_extra_forward_input_arc_of_cch,
+        extra_forward_input_arc_of_cch,
+        first_extra_backward_input_arc_of_cch,
+        extra_backward_input_arc_of_cch,
+    }
+}
+
+/// Finds the up-arc id with tail `lo` and head `hi`. The up-arcs of tail `lo`
+/// are `up_head[up_first_out[lo]..up_first_out[lo+1]]`, sorted ascending, so a
+/// binary search locates `hi`. The arc is guaranteed to exist (every input arc
+/// is part of the symmetrized supergraph).
+fn find_up_arc(up_first_out: &[u32], up_head: &[u32], lo: u32, hi: u32) -> u32 {
+    let start = up_first_out[lo as usize] as usize;
+    let end = up_first_out[lo as usize + 1] as usize;
+    let slice = &up_head[start..end];
+    let offset = slice
+        .binary_search(&hi)
+        .expect("input arc must correspond to an existing CCH up-arc");
+    #[allow(
+        clippy::cast_possible_truncation,
+        reason = "arc id < cch_arc_count <= u32::MAX (CCH limit)"
+    )]
+    let arc = (start + offset) as u32;
+    arc
+}
+
+/// Flattens a per-CCH-arc list of extra input arcs into a CSR pair
+/// `(first_out, flat)` where `flat[first_out[i]..first_out[i+1]]` are the extra
+/// input arcs of CCH arc `i`.
+fn flatten_extra(per_arc: &[Vec<u32>]) -> (Vec<u32>, Vec<u32>) {
+    let mut first_out = vec![0u32; per_arc.len() + 1];
+    for (i, list) in per_arc.iter().enumerate() {
+        #[allow(
+            clippy::cast_possible_truncation,
+            reason = "extra-arc count fits u32 (CCH limit)"
+        )]
+        let len = list.len() as u32;
+        first_out[i + 1] = first_out[i] + len;
+    }
+    let mut flat = Vec::with_capacity(first_out[per_arc.len()] as usize);
+    for list in per_arc {
+        flat.extend_from_slice(list);
+    }
+    (first_out, flat)
 }
 
 /// Computes the (forward) stable sort permutation `p` that orders the arcs
