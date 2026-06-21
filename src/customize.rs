@@ -41,10 +41,10 @@ pub struct Metric {
 /// `inf_weight == 2^31 - 1`, two `inf_weight` summands give `2^32 - 2`, which
 /// does NOT overflow `u32` and stays `> inf_weight`, so any later `min_to`
 /// against a finite value keeps the finite value and unreachable stays
-/// unreachable. We replicate that with a plain wrapping/saturating-free add via
-/// `u64` to avoid Rust's debug overflow panic while producing the identical
-/// `u32` result the C++ computes (no value the C++ produces can exceed
-/// `2*(2^31-1) = 2^32 - 2 < u64::MAX`, and the subsequent `min` is identical).
+/// unreachable. We replicate that with a `u32` wrapping add: the largest
+/// summand pair `2*(2^31-1) = 2^32 - 2` does not wrap, so `wrapping_add`
+/// avoids Rust's debug overflow panic while producing the identical `u32`
+/// result the C++ computes (and the subsequent `min` is identical).
 #[inline]
 fn add(a: u32, b: u32) -> u32 {
     // C++ computes `a + b` in `unsigned` (u32). The largest summand pair is
