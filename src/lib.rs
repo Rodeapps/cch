@@ -29,9 +29,11 @@ pub const INF_WEIGHT: u32 = 2_147_483_647;
 
 pub mod bundle;
 pub mod graph;
+pub mod order;
 pub mod path;
 pub mod query;
 
 pub use bundle::{CchBundle, CchView, MetricBundle, MetricView};
+pub use order::degree_order;
 pub use path::node_path;
 pub use query::distance_matrix;
