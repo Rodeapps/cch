@@ -430,3 +430,363 @@ fn metric_empty() {
     let weights: Vec<u32> = vec![];
     assert_metric_bit_identical("metric_empty", n, &tail, &head, &order, &weights);
 }
+
+// ============================================================================
+// Part C — bundle WRITER parity (THE KILLER GATE).
+//
+// For each fixture: build via oracle and `cch_save_struct` to file A; build via
+// Rust and `Cch::save_struct` to file B; assert the raw FILE BYTES are equal.
+// Same for the metric. This single assertion validates the entire on-disk
+// format (header, fixed sections, the 3 bitvectors, and the LOCAL-id-compressed
+// mapping + extra CSR).
+// ============================================================================
+
+/// Assert that Rust's struct + metric bytes are byte-identical to the oracle's.
+fn assert_writer_byte_identical(
+    name: &str,
+    node_count: u32,
+    tail: &[u32],
+    head: &[u32],
+    order: &[u32],
+    weights: &[u32],
+) {
+    let graph = csr_from_arcs(node_count, tail, head);
+    let dir = tempfile::tempdir().expect("tempdir");
+
+    // ---- Struct ----
+    let cch = unsafe { ffi::cch_new(order, tail, head, |_| {}, false) };
+    let cch_ref = cch.as_ref().expect("cch_new returned null");
+    let oracle_struct = dir.path().join("oracle.cch-struct");
+    unsafe {
+        ffi::cch_save_struct(cch_ref, oracle_struct.to_str().unwrap()).expect("cch_save_struct");
+    }
+
+    let c = Cch::build(&graph, order);
+    let rust_struct = dir.path().join("rust.cch-struct");
+    c.save_struct(&rust_struct).expect("Cch::save_struct");
+
+    let a = std::fs::read(&oracle_struct).expect("read oracle struct");
+    let b = std::fs::read(&rust_struct).expect("read rust struct");
+    assert_eq!(
+        a.len(),
+        b.len(),
+        "[{name}] struct file length differs: oracle={} rust={}",
+        a.len(),
+        b.len()
+    );
+    if a != b {
+        let first = a
+            .iter()
+            .zip(&b)
+            .position(|(x, y)| x != y)
+            .expect("lengths equal but content differs");
+        panic!(
+            "[{name}] struct bytes differ at offset {first}: oracle={:#04x} rust={:#04x}",
+            a[first], b[first]
+        );
+    }
+
+    // ---- Metric ----
+    let mut metric = unsafe { ffi::cch_metric_new(cch_ref, weights) };
+    let oracle_metric = dir.path().join("oracle.cch-metric");
+    unsafe {
+        ffi::cch_metric_customize(metric.as_mut().expect("metric pin"));
+        ffi::cch_save_metric(
+            metric.as_ref().expect("metric ref"),
+            oracle_metric.to_str().unwrap(),
+        )
+        .expect("cch_save_metric");
+    }
+
+    let m = c.customize(weights);
+    let rust_metric = dir.path().join("rust.cch-metric");
+    m.save(&rust_metric).expect("Metric::save");
+
+    let ma = std::fs::read(&oracle_metric).expect("read oracle metric");
+    let mb = std::fs::read(&rust_metric).expect("read rust metric");
+    assert_eq!(ma.len(), mb.len(), "[{name}] metric file length differs");
+    if ma != mb {
+        let first = ma
+            .iter()
+            .zip(&mb)
+            .position(|(x, y)| x != y)
+            .expect("lengths equal but content differs");
+        panic!(
+            "[{name}] metric bytes differ at offset {first}: oracle={:#04x} rust={:#04x}",
+            ma[first], mb[first]
+        );
+    }
+}
+
+#[test]
+fn writer_byte_identical_path_identity() {
+    let n = 5u32;
+    let tail = vec![0u32, 1, 1, 2, 2, 3, 3, 4];
+    let head = vec![1u32, 0, 2, 1, 3, 2, 4, 3];
+    let order: Vec<u32> = (0..n).collect();
+    let weights = vec![10u32, 11, 20, 21, 30, 31, 40, 41];
+    assert_writer_byte_identical("path_identity", n, &tail, &head, &order, &weights);
+}
+
+#[test]
+fn writer_byte_identical_path_reversed() {
+    let n = 5u32;
+    let tail = vec![0u32, 1, 1, 2, 2, 3, 3, 4];
+    let head = vec![1u32, 0, 2, 1, 3, 2, 4, 3];
+    let order: Vec<u32> = (0..n).rev().collect();
+    let weights = vec![10u32, 11, 20, 21, 30, 31, 40, 41];
+    assert_writer_byte_identical("path_reversed", n, &tail, &head, &order, &weights);
+}
+
+#[test]
+fn writer_byte_identical_fillin() {
+    let n = 4u32;
+    let tail = vec![0u32, 0, 0, 1, 2, 3];
+    let head = vec![1u32, 2, 3, 0, 0, 0];
+    let order: Vec<u32> = vec![0, 1, 2, 3];
+    let weights = vec![5u32, 7, 9, 6, 8, 10];
+    assert_writer_byte_identical("fillin", n, &tail, &head, &order, &weights);
+}
+
+#[test]
+fn writer_byte_identical_parallel_arcs() {
+    let n = 4u32;
+    let tail = vec![0u32, 0, 1, 1, 1, 2, 2, 3];
+    let head = vec![1u32, 1, 0, 0, 2, 1, 3, 2];
+    let order: Vec<u32> = vec![0, 1, 2, 3];
+    let weights = vec![50u32, 9, 40, 8, 17, 18, 19, 20];
+    assert_writer_byte_identical("parallel_arcs", n, &tail, &head, &order, &weights);
+}
+
+#[test]
+fn writer_byte_identical_grid_3x3() {
+    let cols = 3u32;
+    let rows = 3u32;
+    let n = cols * rows;
+    let mut tail = Vec::new();
+    let mut head = Vec::new();
+    for r in 0..rows {
+        for c in 0..cols {
+            let v = r * cols + c;
+            if c + 1 < cols {
+                tail.push(v);
+                head.push(v + 1);
+            }
+            if c > 0 {
+                tail.push(v);
+                head.push(v - 1);
+            }
+            if r + 1 < rows {
+                tail.push(v);
+                head.push(v + cols);
+            }
+            if r > 0 {
+                tail.push(v);
+                head.push(v - cols);
+            }
+        }
+    }
+    let order: Vec<u32> = vec![4, 1, 3, 5, 7, 0, 2, 6, 8];
+    #[allow(clippy::cast_possible_truncation)]
+    let weights: Vec<u32> = (0..tail.len() as u32).map(|i| (i + 1) * 3).collect();
+    assert_writer_byte_identical("grid_3x3", n, &tail, &head, &order, &weights);
+}
+
+#[test]
+fn writer_byte_identical_multiedge_selfloop() {
+    let n = 5u32;
+    let tail = vec![0u32, 0, 1, 1, 2, 2, 3, 4];
+    let head = vec![1u32, 1, 2, 3, 2, 3, 4, 0];
+    let order: Vec<u32> = vec![2, 0, 4, 1, 3];
+    let weights = vec![3u32, 4, 5, 6, 7, 8, 9, 10];
+    assert_writer_byte_identical("multiedge_selfloop", n, &tail, &head, &order, &weights);
+}
+
+#[test]
+fn writer_byte_identical_empty_arcs() {
+    let n = 4u32;
+    let tail: Vec<u32> = vec![];
+    let head: Vec<u32> = vec![];
+    let order: Vec<u32> = (0..n).collect();
+    let weights: Vec<u32> = vec![];
+    assert_writer_byte_identical("empty_arcs", n, &tail, &head, &order, &weights);
+}
+
+#[test]
+fn writer_byte_identical_single_node() {
+    let n = 1u32;
+    let tail: Vec<u32> = vec![];
+    let head: Vec<u32> = vec![];
+    let order: Vec<u32> = vec![0];
+    let weights: Vec<u32> = vec![];
+    assert_writer_byte_identical("single_node", n, &tail, &head, &order, &weights);
+}
+
+// ============================================================================
+// Part D — pure-Rust round-trip: Rust write → Rust read (CchBundle/MetricBundle).
+// ============================================================================
+
+#[test]
+fn writer_round_trip_grid() {
+    let cols = 3u32;
+    let rows = 3u32;
+    let n = cols * rows;
+    let mut tail = Vec::new();
+    let mut head = Vec::new();
+    for r in 0..rows {
+        for c in 0..cols {
+            let v = r * cols + c;
+            if c + 1 < cols {
+                tail.push(v);
+                head.push(v + 1);
+            }
+            if c > 0 {
+                tail.push(v);
+                head.push(v - 1);
+            }
+            if r + 1 < rows {
+                tail.push(v);
+                head.push(v + cols);
+            }
+            if r > 0 {
+                tail.push(v);
+                head.push(v - cols);
+            }
+        }
+    }
+    let order: Vec<u32> = vec![4, 1, 3, 5, 7, 0, 2, 6, 8];
+    #[allow(clippy::cast_possible_truncation)]
+    let weights: Vec<u32> = (0..tail.len() as u32).map(|i| (i + 1) * 3).collect();
+    let graph = csr_from_arcs(n, &tail, &head);
+
+    let c = Cch::build(&graph, &order);
+    let m = c.customize(&weights);
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let struct_path = dir.path().join("rt.cch-struct");
+    let metric_path = dir.path().join("rt.cch-metric");
+    c.save_struct(&struct_path).expect("save_struct");
+    m.save(&metric_path).expect("save metric");
+
+    let bundle = cch::bundle::CchBundle::open(&struct_path).expect("open struct");
+    let v = bundle.view();
+    assert_eq!(v.rank, c.rank.as_slice(), "rank round-trip");
+    assert_eq!(
+        v.elimination_tree_parent,
+        c.elimination_tree_parent.as_slice(),
+        "elim round-trip"
+    );
+    assert_eq!(v.up_first_out, c.up_first_out.as_slice(), "up_first_out");
+    assert_eq!(v.up_head, c.up_head.as_slice(), "up_head");
+    assert_eq!(
+        v.down_first_out,
+        c.down_first_out.as_slice(),
+        "down_first_out"
+    );
+    assert_eq!(v.down_head, c.down_head.as_slice(), "down_head");
+    assert_eq!(v.down_to_up, c.down_to_up.as_slice(), "down_to_up");
+
+    let mbundle = cch::bundle::MetricBundle::open(&metric_path).expect("open metric");
+    let mv = mbundle.view();
+    assert_eq!(mv.forward, m.forward.as_slice(), "forward round-trip");
+    assert_eq!(mv.backward, m.backward.as_slice(), "backward round-trip");
+}
+
+// ============================================================================
+// Part E — cross-compat: Rust-written files load in the C++ oracle, and a
+// distance-matrix / node-path query on the loaded bundle matches the direct
+// oracle result.
+// ============================================================================
+
+#[test]
+fn writer_cross_compat_oracle_loads_rust_files() {
+    // A grid with asymmetric weights so the query has a non-trivial answer.
+    let cols = 3u32;
+    let rows = 3u32;
+    let n = cols * rows;
+    let mut tail = Vec::new();
+    let mut head = Vec::new();
+    for r in 0..rows {
+        for c in 0..cols {
+            let v = r * cols + c;
+            if c + 1 < cols {
+                tail.push(v);
+                head.push(v + 1);
+            }
+            if c > 0 {
+                tail.push(v);
+                head.push(v - 1);
+            }
+            if r + 1 < rows {
+                tail.push(v);
+                head.push(v + cols);
+            }
+            if r > 0 {
+                tail.push(v);
+                head.push(v - cols);
+            }
+        }
+    }
+    let order: Vec<u32> = vec![4, 1, 3, 5, 7, 0, 2, 6, 8];
+    #[allow(clippy::cast_possible_truncation)]
+    let weights: Vec<u32> = (0..tail.len() as u32).map(|i| (i + 1) * 3 + 1).collect();
+    let graph = csr_from_arcs(n, &tail, &head);
+
+    // Rust build + write.
+    let c = Cch::build(&graph, &order);
+    let m = c.customize(&weights);
+    let dir = tempfile::tempdir().expect("tempdir");
+    let struct_path = dir.path().join("xc.cch-struct");
+    let metric_path = dir.path().join("xc.cch-metric");
+    c.save_struct(&struct_path).expect("save_struct");
+    m.save(&metric_path).expect("save metric");
+
+    // Oracle loads the Rust-written files.
+    let loaded_cch = unsafe { ffi::cch_load_struct(struct_path.to_str().unwrap()) }
+        .expect("oracle cch_load_struct on rust file");
+    let loaded_cch_ref = loaded_cch.as_ref().expect("loaded cch null");
+    let loaded_metric =
+        unsafe { ffi::cch_load_metric(loaded_cch_ref, metric_path.to_str().unwrap()) }
+            .expect("oracle cch_load_metric on rust file");
+    let loaded_metric_ref = loaded_metric.as_ref().expect("loaded metric null");
+
+    // Direct oracle reference (build + customize, no file round-trip).
+    let direct_cch = unsafe { ffi::cch_new(&order, &tail, &head, |_| {}, false) };
+    let direct_cch_ref = direct_cch.as_ref().expect("direct cch null");
+    let mut direct_metric = unsafe { ffi::cch_metric_new(direct_cch_ref, &weights) };
+    unsafe { ffi::cch_metric_customize(direct_metric.as_mut().expect("pin")) };
+    let direct_metric_ref = direct_metric.as_ref().expect("direct metric null");
+
+    let sources: Vec<u32> = (0..n).collect();
+    let targets: Vec<u32> = (0..n).collect();
+    let loaded_dm =
+        unsafe { ffi::cch_compute_distance_matrix(loaded_metric_ref, &sources, &targets) };
+    let direct_dm =
+        unsafe { ffi::cch_compute_distance_matrix(direct_metric_ref, &sources, &targets) };
+    assert_eq!(
+        loaded_dm, direct_dm,
+        "distance matrix from rust-written bundle must match direct oracle"
+    );
+
+    // Node path: query 0 -> 8 on both, must match.
+    let loaded_q = unsafe { ffi::cch_query_new(loaded_metric_ref) };
+    let mut loaded_q = loaded_q;
+    let direct_q = unsafe { ffi::cch_query_new(direct_metric_ref) };
+    let mut direct_q = direct_q;
+    let loaded_path = unsafe {
+        ffi::cch_query_add_source(loaded_q.as_mut().unwrap(), 0, 0);
+        ffi::cch_query_add_target(loaded_q.as_mut().unwrap(), 8, 0);
+        ffi::cch_query_run(loaded_q.as_mut().unwrap());
+        ffi::cch_query_node_path(loaded_q.as_ref().unwrap())
+    };
+    let direct_path = unsafe {
+        ffi::cch_query_add_source(direct_q.as_mut().unwrap(), 0, 0);
+        ffi::cch_query_add_target(direct_q.as_mut().unwrap(), 8, 0);
+        ffi::cch_query_run(direct_q.as_mut().unwrap());
+        ffi::cch_query_node_path(direct_q.as_ref().unwrap())
+    };
+    assert_eq!(
+        loaded_path, direct_path,
+        "node path from rust-written bundle must match direct oracle"
+    );
+}

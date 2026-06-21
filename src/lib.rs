@@ -34,6 +34,7 @@ pub mod order;
 pub mod path;
 pub mod query;
 pub mod structure;
+mod writer;
 
 pub use bundle::{CchBundle, CchView, MetricBundle, MetricView};
 pub use customize::Metric;
