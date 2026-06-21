@@ -15,10 +15,15 @@ jobs:
       - name: Install stable Rust
         uses: dtolnay/rust-toolchain@stable
         with:
-          components: rustfmt, clippy
+          components: rustfmt, clippy, llvm-tools-preview
 
       - name: Install C++ toolchain (required by oracle dev-dependency)
         run: sudo apt-get update && sudo apt-get install -y clang
+
+      - name: Install cargo-llvm-cov
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-llvm-cov
 
       - name: Cache Rust build artifacts
         uses: Swatinem/rust-cache@v2
@@ -31,3 +36,6 @@ jobs:
 
       - name: Test
         run: cargo test
+
+      - name: Coverage gate (100% lines required)
+        run: cargo llvm-cov --fail-under-lines 100

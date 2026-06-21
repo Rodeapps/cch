@@ -331,24 +331,19 @@ mod tests {
     }
 
     /// Customized weight of the ORIGINAL arc (u,v): look up the up-arc u→v
-    /// (forward weight) or the reverse direction. For this fixture all original
-    /// arcs survive as CCH arcs in one direction.
+    /// (forward weight) or the reverse up-arc v→u (backward weight). For this
+    /// fixture all original arcs survive as CCH arcs in one direction.
     fn original_arc_weight(cch: &CchView, metric: &MetricView, u: u32, v: u32) -> u64 {
         let ru = cch.rank[u as usize];
         let rv = cch.rank[v as usize];
-        // Try forward up-arc ru → rv.
-        for i in cch.up_first_out[ru as usize]..cch.up_first_out[ru as usize + 1] {
-            if cch.up_head[i as usize] == rv {
-                return u64::from(metric.forward[i as usize]);
-            }
-        }
-        // Try the reverse up-arc rv → ru, read its backward weight.
-        for i in cch.up_first_out[rv as usize]..cch.up_first_out[rv as usize + 1] {
-            if cch.up_head[i as usize] == ru {
-                return u64::from(metric.backward[i as usize]);
-            }
-        }
-        panic!("no original CCH arc between rank {ru} and {rv}");
+        let fwd = (cch.up_first_out[ru as usize]..cch.up_first_out[ru as usize + 1])
+            .find(|&i| cch.up_head[i as usize] == rv)
+            .map(|i| u64::from(metric.forward[i as usize]));
+        let bwd = (cch.up_first_out[rv as usize]..cch.up_first_out[rv as usize + 1])
+            .find(|&i| cch.up_head[i as usize] == ru)
+            .map(|i| u64::from(metric.backward[i as usize]));
+        fwd.or(bwd)
+            .unwrap_or_else(|| panic!("no original CCH arc between rank {ru} and {rv}"))
     }
 
     /// Path endpoints must equal source/target; sum of original-arc weights
@@ -412,6 +407,172 @@ mod tests {
         let metric_bundle = MetricBundle::open(&mp).unwrap();
         // 1 → 0 should be unreachable.
         assert!(node_path(&cch_bundle.view(), &metric_bundle.view(), 1, 0).is_none());
+    }
+
+    /// Verify `original_arc_weight` handles the second loop (backward direction
+    /// lookup). The path from 5 to 0 in the 10-node cycle includes arc 9→0,
+    /// where rank(9) = 9 > rank(0) = 0, which forces the second loop in
+    /// `original_arc_weight`.
+    #[test]
+    fn path_query_backward_arc_weight_lookup() {
+        use crate::bundle::{CchBundle, MetricBundle};
+        use crate::query::distance_matrix;
+
+        let (sp, mp) = test_bundle_paths();
+        let cch_bundle = CchBundle::open(&sp).unwrap();
+        let metric_bundle = MetricBundle::open(&mp).unwrap();
+        let (cv, mv) = (cch_bundle.view(), metric_bundle.view());
+        let (s, t) = (5u32, 0u32);
+        let path = node_path(&cv, &mv, s, t).expect("5→0 should be reachable");
+        assert_eq!(*path.first().unwrap(), s);
+        assert_eq!(*path.last().unwrap(), t);
+        let dist = distance_matrix(&cv, &mv, &[s], &[t])[0];
+        let summed: u64 = path
+            .windows(2)
+            .map(|w| original_arc_weight(&cv, &mv, w[0], w[1]))
+            .sum();
+        assert_eq!(summed, u64::from(dist));
+    }
+
+    /// Cover the `panic!` in `original_arc_weight` (line 351): when called on a
+    /// pair with no CCH arc in either direction, the function must panic.
+    /// Use a 6-node graph with isolated node 5 and call `original_arc_weight`
+    /// for nodes (5, 0) — no CCH arc connects them.
+    #[test]
+    #[should_panic(expected = "no original CCH arc between rank")]
+    fn original_arc_weight_panics_on_disconnected_pair() {
+        use crate::bundle::{CchBundle, MetricBundle};
+        use routingkit_cch::ffi;
+
+        let tail: Vec<u32> = vec![0, 1, 2, 3, 4, 3, 2, 1];
+        let head: Vec<u32> = vec![1, 2, 3, 4, 3, 2, 1, 0];
+        let weights: Vec<u32> = (1..=8u32).collect();
+        // Node 5 is isolated (not in tail or head).
+        let n: u32 = 6;
+        let order: Vec<u32> = (0..n).collect();
+
+        let cch = unsafe { ffi::cch_new(&order, &tail, &head, |_| {}, false) };
+        let cch_ref = cch.as_ref().expect("cch_new returned null");
+        let dir = tempfile::tempdir().expect("tempdir");
+        let sp = dir.path().join("iso.cch-struct");
+        let mp = dir.path().join("iso.cch-metric");
+        let mut metric = unsafe { ffi::cch_metric_new(cch_ref, &weights) };
+        unsafe {
+            ffi::cch_save_struct(cch_ref, sp.to_str().unwrap()).unwrap();
+            ffi::cch_metric_customize(metric.as_mut().unwrap());
+            ffi::cch_save_metric(metric.as_ref().unwrap(), mp.to_str().unwrap()).unwrap();
+        }
+        let cch_bundle = CchBundle::open(&sp).unwrap();
+        let metric_bundle = MetricBundle::open(&mp).unwrap();
+        let (cv, mv) = (cch_bundle.view(), metric_bundle.view());
+        // Node 5 is isolated → no CCH arc between node 5 and node 0 → panic.
+        original_arc_weight(&cv, &mv, 5, 0);
+    }
+
+    /// All-pairs path validity: every reachable (s,t) pair on the 10-node
+    /// fixture must produce a path whose endpoint matches and whose summed
+    /// original-arc weight equals the query distance. This exercises more
+    /// code paths including potential `Dir::Fwd` shortcuts.
+    #[test]
+    fn path_query_all_pairs_valid() {
+        use crate::bundle::{CchBundle, MetricBundle};
+        use crate::query::distance_matrix;
+
+        let (sp, mp) = test_bundle_paths();
+        let cch_bundle = CchBundle::open(&sp).unwrap();
+        let metric_bundle = MetricBundle::open(&mp).unwrap();
+        let (cv, mv) = (cch_bundle.view(), metric_bundle.view());
+        let n = 10u32;
+
+        for s in 0..n {
+            for t in 0..n {
+                if s == t {
+                    continue;
+                }
+                // The 10-node cycle is strongly connected: every pair is reachable.
+                let dist = distance_matrix(&cv, &mv, &[s], &[t])[0];
+                let path = node_path(&cv, &mv, s, t).expect("reachable");
+                assert_eq!(*path.first().unwrap(), s);
+                assert_eq!(*path.last().unwrap(), t);
+                let summed: u64 = path
+                    .windows(2)
+                    .map(|w| original_arc_weight(&cv, &mv, w[0], w[1]))
+                    .sum();
+                assert_eq!(summed, u64::from(dist), "path weight mismatch for {s}→{t}");
+            }
+        }
+    }
+
+    /// Cover the `cpp_vec.is_empty() → None` branch (line 488 in the 200-pair
+    /// test) by running the same normalisation logic on a graph where a pair
+    /// is genuinely unreachable. Single arc 0→1 makes 1→0 unreachable; the C++
+    /// oracle returns an empty path vec, which we map to `None`.
+    #[test]
+    fn mmap_unpack_none_for_unreachable_pair() {
+        use crate::bundle::{CchBundle, MetricBundle};
+        use routingkit_cch::ffi;
+
+        let tail = vec![0u32];
+        let head = vec![1u32];
+        let weights = vec![7u32];
+        let order = vec![0u32, 1];
+        let cch = unsafe { ffi::cch_new(&order, &tail, &head, |_| {}, false) };
+
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let sp = tmp.path().join("none.cch-struct");
+        let mp = tmp.path().join("none.cch-metric");
+        let metric_uptr;
+        unsafe {
+            ffi::cch_save_struct(cch.as_ref().unwrap(), sp.to_str().unwrap()).unwrap();
+            let mut metric = ffi::cch_metric_new(cch.as_ref().unwrap(), &weights);
+            ffi::cch_metric_customize(metric.as_mut().unwrap());
+            ffi::cch_save_metric(metric.as_ref().unwrap(), mp.to_str().unwrap()).unwrap();
+            metric_uptr = metric;
+        }
+        let _ = tmp.keep();
+
+        let cch_bundle = CchBundle::open(&sp).unwrap();
+        let metric_bundle = MetricBundle::open(&mp).unwrap();
+        let (cv, mv) = (cch_bundle.view(), metric_bundle.view());
+
+        // Ask C++ oracle for unreachable pair (1→0).
+        let mut q = unsafe { ffi::cch_query_new(metric_uptr.as_ref().unwrap()) };
+        unsafe {
+            ffi::cch_query_add_source(q.as_mut().unwrap(), 1, 0);
+            ffi::cch_query_add_target(q.as_mut().unwrap(), 0, 0);
+            ffi::cch_query_run(q.as_mut().unwrap());
+        }
+        let cpp_path = unsafe { ffi::cch_query_node_path(q.as_ref().unwrap()) };
+        let cpp_vec: Vec<u32> = cpp_path.clone();
+
+        // C++ oracle returns empty vec for unreachable pair; our impl returns None.
+        assert!(
+            cpp_vec.is_empty(),
+            "oracle must return empty path for unreachable 1→0"
+        );
+        let ours = node_path(&cv, &mv, 1, 0);
+        assert!(ours.is_none(), "1→0 is unreachable");
+
+        // Also verify a REACHABLE pair (0→1): oracle returns a non-empty path,
+        // our impl returns Some.
+        let mut q2 = unsafe { ffi::cch_query_new(metric_uptr.as_ref().unwrap()) };
+        unsafe {
+            ffi::cch_query_add_source(q2.as_mut().unwrap(), 0, 0);
+            ffi::cch_query_add_target(q2.as_mut().unwrap(), 1, 0);
+            ffi::cch_query_run(q2.as_mut().unwrap());
+        }
+        let cpp_path2 = unsafe { ffi::cch_query_node_path(q2.as_ref().unwrap()) };
+        let cpp_vec2: Vec<u32> = cpp_path2.clone();
+        assert!(
+            !cpp_vec2.is_empty(),
+            "oracle must return path for reachable 0→1"
+        );
+        let ours2 = node_path(&cv, &mv, 0, 1);
+        assert_eq!(
+            ours2,
+            Some(cpp_vec2),
+            "both should agree for reachable pair 0→1"
+        );
     }
 
     /// The 200-pair equivalence gate: assert our pure-Rust `node_path` matches
@@ -484,14 +645,112 @@ mod tests {
             let cpp_vec: Vec<u32> = cpp_path.clone();
 
             // Normalize to Option: empty cpp_vec means unreachable → None.
-            let theirs: Option<Vec<u32>> = if cpp_vec.is_empty() {
-                None
-            } else {
-                Some(cpp_vec)
-            };
+            let theirs: Option<Vec<u32>> = (!cpp_vec.is_empty()).then_some(cpp_vec);
             let ours = node_path(&cv, &mv, s, t);
 
             assert_eq!(ours, theirs, "path mismatch for ({s} -> {t})");
         }
+    }
+
+    /// Cover the `Dir::Fwd` shortcut recursion in `unpack_arc` (lines 94-96).
+    /// These lines fire when `unpack_arc` is called with `Dir::Fwd` AND the
+    /// arc is a CCH shortcut with a common lower-ranked witness z satisfying:
+    ///   `forward[xy] == backward[z→x arc] + forward[z→y arc]`
+    ///
+    /// Requires a BIDIRECTIONAL graph (finite `backward` weights) AND a graph
+    /// topology that creates shortcuts. A directed-only graph has `INF_WEIGHT`
+    /// backward weights so the condition never fires.
+    ///
+    /// Diamond graph 0↔1, 0↔2, 1↔3, 2↔3 with unit weights and identity
+    /// ordering [0,1,2,3]. Contracting node 0 (rank 0) creates shortcut 1↔2
+    /// (the only path from 1 to 2 in the remaining graph via 0). For query
+    /// source=1, target=2, the forward path traverses shortcut 1→2; the
+    /// witness is z=0 and both `backward[0→1]=1` and `forward[0→2]=1` are
+    /// finite, so `forward[1→2]=2 == 1+1`. Lines 94-96 are executed.
+    #[test]
+    fn path_query_fwd_unpack_shortcut() {
+        use crate::bundle::{CchBundle, MetricBundle};
+        use routingkit_cch::ffi;
+
+        // Diamond: 0↔1, 0↔2, 1↔3, 2↔3 (unit weights, bidirectional).
+        // Arcs encoded as directed pairs (both directions):
+        //   0→1, 0→2, 1→3, 2→3, 1→0, 2→0, 3→1, 3→2
+        let tail: Vec<u32> = vec![0, 0, 1, 2, 1, 2, 3, 3];
+        let head: Vec<u32> = vec![1, 2, 3, 3, 0, 0, 1, 2];
+        let weights: Vec<u32> = vec![1u32; tail.len()];
+        // Identity ordering: node 0 contracted first, then 1, 2, 3.
+        let order: Vec<u32> = vec![0, 1, 2, 3];
+
+        let cch = unsafe { ffi::cch_new(&order, &tail, &head, |_| {}, false) };
+        let cch_ref = cch.as_ref().expect("cch_new returned null");
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let sp = dir.path().join("diamond.cch-struct");
+        let mp = dir.path().join("diamond.cch-metric");
+        let mut metric = unsafe { ffi::cch_metric_new(cch_ref, &weights) };
+        unsafe {
+            ffi::cch_save_struct(cch_ref, sp.to_str().unwrap()).unwrap();
+            ffi::cch_metric_customize(metric.as_mut().unwrap());
+            ffi::cch_save_metric(metric.as_ref().unwrap(), mp.to_str().unwrap()).unwrap();
+        }
+
+        let cch_bundle = CchBundle::open(&sp).unwrap();
+        let metric_bundle = MetricBundle::open(&mp).unwrap();
+        let (cv, mv) = (cch_bundle.view(), metric_bundle.view());
+
+        // Query 1→2: shortest path cost = 2 (via node 0: 1→0→2).
+        // The CCH forward half traverses the shortcut 1→2 (via contracted node 0).
+        // Inside unpack_arc(Dir::Fwd, 1, 2, shortcut), z=0 is found, and
+        // forward[1→2] == backward[0→1] + forward[0→2] = 1+1 = 2. Lines 94-96.
+        let path_12 = node_path(&cv, &mv, 1, 2).expect("1→2 reachable in diamond");
+        assert_eq!(*path_12.first().unwrap(), 1);
+        assert_eq!(*path_12.last().unwrap(), 2);
+        assert_eq!(path_12.len(), 3, "path 1→0→2 has 3 nodes");
+
+        // Also verify 0→3: longest path exercising more shortcuts.
+        let path_03 = node_path(&cv, &mv, 0, 3).expect("0→3 reachable");
+        assert_eq!(*path_03.first().unwrap(), 0);
+        assert_eq!(*path_03.last().unwrap(), 3);
+    }
+
+    /// Cover the `if dx != INF_WEIGHT` false branch in the forward sweep of
+    /// `node_path`. This branch fires when a node in the source's elimination-
+    /// tree ancestor chain has `INF_WEIGHT` tentative distance. This happens
+    /// when all arc weights in the metric are `INF_WEIGHT`: the source gets
+    /// dist=0, but `0.saturating_add(INF_WEIGHT) = INF_WEIGHT` which is NOT
+    /// strictly less than `INF_WEIGHT`, so the parent is never updated. The
+    /// second loop iteration enters the else branch.
+    #[test]
+    fn path_query_fwd_sweep_inf_weight_branch() {
+        use crate::bundle::{CchBundle, MetricBundle};
+        use routingkit_cch::ffi;
+
+        // 5-node path graph; all arc weights = INF_WEIGHT.
+        let n: u32 = 5;
+        let order: Vec<u32> = (0..n).collect();
+        let tail: Vec<u32> = (0..n - 1).collect();
+        let head: Vec<u32> = (1..n).collect();
+        let weights: Vec<u32> = vec![crate::INF_WEIGHT; tail.len()];
+
+        let cch = unsafe { ffi::cch_new(&order, &tail, &head, |_| {}, false) };
+        let cch_ref = cch.as_ref().expect("cch_new returned null");
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let sp = dir.path().join("fwdinf.cch-struct");
+        let mp = dir.path().join("fwdinf.cch-metric");
+        let mut metric = unsafe { ffi::cch_metric_new(cch_ref, &weights) };
+        unsafe {
+            ffi::cch_save_struct(cch_ref, sp.to_str().unwrap()).unwrap();
+            ffi::cch_metric_customize(metric.as_mut().unwrap());
+            ffi::cch_save_metric(metric.as_ref().unwrap(), mp.to_str().unwrap()).unwrap();
+        }
+
+        let cch_bundle = CchBundle::open(&sp).unwrap();
+        let metric_bundle = MetricBundle::open(&mp).unwrap();
+        let (cv, mv) = (cch_bundle.view(), metric_bundle.view());
+
+        // All arcs have INF_WEIGHT → no relaxation from source → ancestors at INF.
+        let result = node_path(&cv, &mv, 0, 4);
+        assert!(result.is_none(), "all-INF metric means 0→4 is unreachable");
     }
 }

@@ -366,22 +366,166 @@ mod tests {
             // INF_WEIGHT.
             let oracle_unreachable = oracle_val == u32::MAX || oracle_val == INF_WEIGHT;
             let rust_unreachable = rust_val == INF_WEIGHT;
+            // Pre-compute row/col so they are always instrumented (not lazy).
+            let row = k / (n as usize);
+            let col = k % (n as usize);
             assert_eq!(
-                oracle_unreachable,
-                rust_unreachable,
-                "reachability mismatch at index {k} (i={}, j={}): oracle={oracle_val}, rust={rust_val}",
-                k / (n as usize),
-                k % (n as usize),
+                oracle_unreachable, rust_unreachable,
+                "reachability mismatch at index {k} (i={row}, j={col}): oracle={oracle_val}, rust={rust_val}",
             );
             if !oracle_unreachable && !rust_unreachable {
                 assert_eq!(
-                    oracle_val,
-                    rust_val,
-                    "distance mismatch at index {k} (i={}, j={}): oracle={oracle_val}, rust={rust_val}",
-                    k / (n as usize),
-                    k % (n as usize),
+                    oracle_val, rust_val,
+                    "distance mismatch at index {k} (i={row}, j={col}): oracle={oracle_val}, rust={rust_val}",
                 );
             }
         }
+    }
+
+    #[test]
+    fn distance_matrix_empty_sources_returns_empty() {
+        use crate::bundle::{CchBundle, MetricBundle};
+        use routingkit_cch::ffi;
+
+        let n: u32 = 5;
+        let order: Vec<u32> = (0..n).collect();
+        let tail: Vec<u32> = (0..n - 1).collect();
+        let head: Vec<u32> = (1..n).collect();
+        let cch = unsafe { ffi::cch_new(&order, &tail, &head, |_| {}, false) };
+        let cch_ref = cch.as_ref().expect("cch_new returned null");
+        let dir = tempfile::tempdir().expect("tempdir");
+        let struct_path = dir.path().join("q.cch-struct");
+        let metric_path = dir.path().join("q.cch-metric");
+        #[allow(clippy::cast_possible_truncation)]
+        let weights: Vec<u32> = (0..tail.len() as u32).collect();
+        let mut metric = unsafe { ffi::cch_metric_new(cch_ref, &weights) };
+        unsafe {
+            ffi::cch_save_struct(cch_ref, struct_path.to_str().unwrap()).unwrap();
+            ffi::cch_metric_customize(metric.as_mut().unwrap());
+            ffi::cch_save_metric(metric.as_ref().unwrap(), metric_path.to_str().unwrap()).unwrap();
+        }
+        let cch_bundle = CchBundle::open(&struct_path).unwrap();
+        let metric_bundle = MetricBundle::open(&metric_path).unwrap();
+        let cv = cch_bundle.view();
+        let mv = metric_bundle.view();
+
+        // Empty sources.
+        let result = distance_matrix(&cv, &mv, &[], &[0, 1]);
+        assert!(result.is_empty());
+
+        // Empty targets.
+        let result = distance_matrix(&cv, &mv, &[0, 1], &[]);
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    #[should_panic(expected = "pin_targets called twice")]
+    fn pin_targets_twice_panics() {
+        use crate::bundle::CchBundle;
+        use routingkit_cch::ffi;
+
+        let n: u32 = 5;
+        let order: Vec<u32> = (0..n).collect();
+        let tail: Vec<u32> = (0..n - 1).collect();
+        let head: Vec<u32> = (1..n).collect();
+        let cch = unsafe { ffi::cch_new(&order, &tail, &head, |_| {}, false) };
+        let cch_ref = cch.as_ref().expect("cch_new returned null");
+        let dir = tempfile::tempdir().expect("tempdir");
+        let struct_path = dir.path().join("p.cch-struct");
+        unsafe {
+            ffi::cch_save_struct(cch_ref, struct_path.to_str().unwrap()).unwrap();
+        }
+        let cch_bundle = CchBundle::open(&struct_path).unwrap();
+        let cv = cch_bundle.view();
+
+        let mut q = ElimTreeQuery::new(&cv);
+        q.pin_targets(&[0]);
+        q.pin_targets(&[1]); // should panic
+    }
+
+    #[test]
+    #[should_panic(expected = "out buffer length must equal")]
+    fn get_distances_wrong_len_panics() {
+        use crate::bundle::{CchBundle, MetricBundle};
+        use routingkit_cch::ffi;
+
+        let n: u32 = 5;
+        let order: Vec<u32> = (0..n).collect();
+        let tail: Vec<u32> = (0..n - 1).collect();
+        let head: Vec<u32> = (1..n).collect();
+        let cch = unsafe { ffi::cch_new(&order, &tail, &head, |_| {}, false) };
+        let cch_ref = cch.as_ref().expect("cch_new returned null");
+        let dir = tempfile::tempdir().expect("tempdir");
+        let struct_path = dir.path().join("g.cch-struct");
+        let metric_path = dir.path().join("g.cch-metric");
+        #[allow(clippy::cast_possible_truncation)]
+        let weights: Vec<u32> = (0..tail.len() as u32).collect();
+        let mut metric = unsafe { ffi::cch_metric_new(cch_ref, &weights) };
+        unsafe {
+            ffi::cch_save_struct(cch_ref, struct_path.to_str().unwrap()).unwrap();
+            ffi::cch_metric_customize(metric.as_mut().unwrap());
+            ffi::cch_save_metric(metric.as_ref().unwrap(), metric_path.to_str().unwrap()).unwrap();
+        }
+        let cch_bundle = CchBundle::open(&struct_path).unwrap();
+        let metric_bundle = MetricBundle::open(&metric_path).unwrap();
+        let cv = cch_bundle.view();
+        let mv = metric_bundle.view();
+
+        let mut q = ElimTreeQuery::new(&cv);
+        q.pin_targets(&[0, 1]);
+        q.add_source_and_run(&mv, 0);
+        let mut out = vec![0u32; 3]; // wrong length — should be 2
+        q.get_distances_to_targets(&mut out); // should panic
+    }
+
+    /// Cover the `if dx != INF_WEIGHT` false branch in `add_source_and_run`
+    /// (line 178). This branch fires when a node on the source's elimination-
+    /// tree ancestor path has `INF_WEIGHT` tentative distance. This happens
+    /// when all edges in the metric have weight `INF_WEIGHT`: the source gets
+    /// dist=0 but `0.saturating_add(INF_WEIGHT) = INF_WEIGHT` which is NOT
+    /// less than `INF_WEIGHT`, so the parent is never relaxed and remains at
+    /// `INF_WEIGHT` on the second loop iteration.
+    #[test]
+    fn add_source_run_inf_weight_branch() {
+        use crate::bundle::{CchBundle, MetricBundle};
+        use routingkit_cch::ffi;
+
+        // 5-node path graph. All edge weights = INF_WEIGHT so the metric
+        // customization leaves all arc weights at INF_WEIGHT.
+        let n: u32 = 5;
+        let order: Vec<u32> = (0..n).collect();
+        let tail: Vec<u32> = (0..n - 1).collect();
+        let head: Vec<u32> = (1..n).collect();
+        let weights: Vec<u32> = vec![crate::INF_WEIGHT; tail.len()];
+
+        let cch = unsafe { ffi::cch_new(&order, &tail, &head, |_| {}, false) };
+        let cch_ref = cch.as_ref().expect("cch_new returned null");
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let struct_path = dir.path().join("infwt.cch-struct");
+        let metric_path = dir.path().join("infwt.cch-metric");
+        let mut metric = unsafe { ffi::cch_metric_new(cch_ref, &weights) };
+        unsafe {
+            ffi::cch_save_struct(cch_ref, struct_path.to_str().unwrap()).unwrap();
+            ffi::cch_metric_customize(metric.as_mut().unwrap());
+            ffi::cch_save_metric(metric.as_ref().unwrap(), metric_path.to_str().unwrap()).unwrap();
+        }
+
+        let cch_bundle = CchBundle::open(&struct_path).unwrap();
+        let metric_bundle = MetricBundle::open(&metric_path).unwrap();
+        let cv = cch_bundle.view();
+        let mv = metric_bundle.view();
+
+        // Source = 0 (rank 0). All metric weights are INF_WEIGHT so no arc
+        // propagates a finite distance. The parent of rank[0] in the elim
+        // tree starts at INF_WEIGHT and stays there (0 + INF_WEIGHT ==
+        // INF_WEIGHT which is not less than INF_WEIGHT). The second loop
+        // iteration enters the `dx == INF_WEIGHT` branch.
+        let mut q = ElimTreeQuery::new(&cv);
+        q.pin_targets(&[4]);
+        q.add_source_and_run(&mv, 0);
+        let mut out = vec![0u32; 1];
+        q.get_distances_to_targets(&mut out);
+        assert_eq!(out[0], crate::INF_WEIGHT);
     }
 }

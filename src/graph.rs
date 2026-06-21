@@ -37,3 +37,27 @@ impl Graph {
         self.head.len()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn graph_node_and_arc_count() {
+        let g = Graph {
+            first_out: vec![0, 2, 3, 3],
+            head: vec![1, 2, 0],
+            weight: vec![10, 20, 30],
+        };
+        assert_eq!(g.node_count(), 3);
+        assert_eq!(g.arc_count(), 3);
+
+        let empty = Graph {
+            first_out: vec![0],
+            head: vec![],
+            weight: vec![],
+        };
+        assert_eq!(empty.node_count(), 0);
+        assert_eq!(empty.arc_count(), 0);
+    }
+}

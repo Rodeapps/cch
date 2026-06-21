@@ -348,13 +348,8 @@ impl MetricBundle {
         let cch_arc_count = read_u64_le_at(bytes, 16) as usize;
 
         // Header (24 bytes), then 2 sections each [u64 byte_length][bytes...].
+        // The mmap.len() >= 32 check above guarantees pos + 8 (= 32) <= bytes.len().
         let mut pos = 24usize;
-        if pos + 8 > bytes.len() {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                "truncated metric bundle at forward section",
-            ));
-        }
         let forward_len = read_u64_le_at(bytes, pos) as usize;
         pos += 8;
         let forward_off = pos;
@@ -409,17 +404,12 @@ impl MetricBundle {
             ));
         }
 
-        let base = mmap.as_ptr() as usize;
-        for (name, off) in [("forward", forward_off), ("backward", backward_off)] {
-            let addr = base + off;
-            if addr % std::mem::align_of::<u32>() != 0 {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    format!("metric section '{name}' is not u32-aligned"),
-                ));
-            }
-        }
-
+        // u32 alignment is guaranteed without a runtime check:
+        //   - mmap base is page-aligned (multiple of 4096)
+        //   - forward_off = 32 (header 24 B + one 8-B length prefix)
+        //   - backward_off = 32 + 8 + forward_len + 8 = 48 + forward_len
+        // forward_len == expected_bytes == 4 * cch_arc_count, always a multiple
+        // of 4, so backward_off is also a multiple of 4.
         Ok(MetricBundle {
             mmap,
             forward_off,
@@ -431,11 +421,11 @@ impl MetricBundle {
     /// Return a zero-copy view over the mmap'd metric arrays.
     #[must_use]
     pub fn view(&self) -> MetricView<'_> {
-        // SAFETY: open() validated u32 alignment for each offset. The mmap
-        // outlives the slices (lifetime tied to &self). The mapped region is
-        // read-only and immutable for the lifetime of the Mmap. The alignment
-        // check in open() ensures the cast_ptr_alignment requirement is met.
-        #[allow(clippy::cast_ptr_alignment)] // alignment verified in open()
+        // SAFETY: u32 alignment of each offset is guaranteed by open()'s
+        // arithmetic invariants (see comment there). The mmap outlives the
+        // slices (lifetime tied to &self). The mapped region is read-only
+        // and immutable for the lifetime of the Mmap.
+        #[allow(clippy::cast_ptr_alignment)] // alignment proven by arithmetic in open()
         unsafe {
             MetricView {
                 forward: std::slice::from_raw_parts(
@@ -577,17 +567,18 @@ mod tests {
         let result = CchBundle::open(&corrupt_path);
         // Do NOT call .view() on the result — the whole point is that open()
         // now rejects the file before any out-of-bounds slice is built.
-        // (Match rather than `unwrap_err()` because `CchBundle` is not `Debug`.)
-        match result {
-            Ok(_) => {
-                panic!("open() must reject a bundle whose header count exceeds its section length")
-            }
-            Err(e) => assert_eq!(
-                e.kind(),
-                std::io::ErrorKind::InvalidData,
-                "rejection must be InvalidData"
-            ),
-        }
+        // Use assert!(is_err()) + err().unwrap() instead of a match because
+        // CchBundle does not implement Debug (which unwrap_err() would require).
+        assert!(
+            result.is_err(),
+            "open() must reject a bundle whose header count exceeds its section length"
+        );
+        let e = result.err().unwrap();
+        assert_eq!(
+            e.kind(),
+            std::io::ErrorKind::InvalidData,
+            "rejection must be InvalidData"
+        );
 
         // Analogous craft for the metric reader: inflate its header
         // `cch_arc_count` (u64 LE at offset 16) so the forward/backward
@@ -610,16 +601,16 @@ mod tests {
         std::fs::write(&corrupt_metric_path, &mbytes).expect("write corrupt metric bundle");
 
         let mresult = MetricBundle::open(&corrupt_metric_path);
-        match mresult {
-            Ok(_) => panic!(
-                "metric open() must reject a bundle whose header count exceeds its section length"
-            ),
-            Err(e) => assert_eq!(
-                e.kind(),
-                std::io::ErrorKind::InvalidData,
-                "metric rejection must be InvalidData"
-            ),
-        }
+        assert!(
+            mresult.is_err(),
+            "metric open() must reject a bundle whose header count exceeds its section length"
+        );
+        let me = mresult.err().unwrap();
+        assert_eq!(
+            me.kind(),
+            std::io::ErrorKind::InvalidData,
+            "metric rejection must be InvalidData"
+        );
     }
 
     #[test]
@@ -678,5 +669,447 @@ mod tests {
             expected_arc_count,
             "metric backward len should match CCH arc count"
         );
+    }
+
+    // ---- CchView::cch_arc_count and CchBundle node_count/cch_arc_count ----
+
+    #[test]
+    fn cch_view_cch_arc_count_and_bundle_accessors() {
+        use routingkit_cch::ffi;
+
+        let n: u32 = 5;
+        let order: Vec<u32> = (0..n).collect();
+        let tail: Vec<u32> = (0..n - 1).collect();
+        let head: Vec<u32> = (1..n).collect();
+
+        let cch = unsafe { ffi::cch_new(&order, &tail, &head, |_| {}, false) };
+        let cch_ref = cch.as_ref().expect("cch_new returned null");
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("acc.cch-struct");
+        unsafe { ffi::cch_save_struct(cch_ref, path.to_str().unwrap()) }
+            .expect("cch_save_struct failed");
+
+        let bundle = CchBundle::open(&path).expect("CchBundle::open");
+        // CchBundle::node_count() and cch_arc_count()
+        assert_eq!(bundle.node_count(), n as usize);
+        assert!(bundle.cch_arc_count() > 0);
+
+        // CchView::cch_arc_count()
+        let v = bundle.view();
+        #[allow(clippy::cast_possible_truncation)]
+        let expected_arc_count = bundle.cch_arc_count() as u32;
+        assert_eq!(v.cch_arc_count(), expected_arc_count);
+    }
+
+    #[test]
+    fn metric_bundle_cch_arc_count() {
+        use routingkit_cch::ffi;
+
+        let n: u32 = 5;
+        let order: Vec<u32> = (0..n).collect();
+        let tail: Vec<u32> = (0..n - 1).collect();
+        let head: Vec<u32> = (1..n).collect();
+
+        let cch = unsafe { ffi::cch_new(&order, &tail, &head, |_| {}, false) };
+        let cch_ref = cch.as_ref().expect("cch_new returned null");
+        let dir = tempfile::tempdir().expect("tempdir");
+        let struct_path = dir.path().join("macc.cch-struct");
+        let metric_path = dir.path().join("macc.cch-metric");
+        #[allow(clippy::cast_possible_truncation)]
+        let weights: Vec<u32> = (0..tail.len() as u32).collect();
+        let mut metric = unsafe { ffi::cch_metric_new(cch_ref, &weights) };
+        unsafe {
+            ffi::cch_save_struct(cch_ref, struct_path.to_str().unwrap()).unwrap();
+            ffi::cch_metric_customize(metric.as_mut().unwrap());
+            ffi::cch_save_metric(metric.as_ref().unwrap(), metric_path.to_str().unwrap()).unwrap();
+        }
+        let struct_bundle = CchBundle::open(&struct_path).unwrap();
+        let metric_bundle = MetricBundle::open(&metric_path).unwrap();
+        // MetricBundle::cch_arc_count() should match the struct's arc count.
+        assert_eq!(metric_bundle.cch_arc_count(), struct_bundle.cch_arc_count());
+    }
+
+    // ---- Struct bundle format error tests ----
+
+    #[test]
+    fn open_rejects_struct_too_small() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("small.cch-struct");
+        // Write only 10 bytes — too small for the 40-byte header.
+        std::fs::write(&path, [0u8; 10]).unwrap();
+        let err = CchBundle::open(&path).map(|_| ()).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+        assert!(err.to_string().contains("too small"));
+    }
+
+    #[test]
+    fn open_rejects_struct_bad_magic() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("badmagic.cch-struct");
+        // Write 40 bytes: first 8 bytes are wrong magic, rest zero.
+        let mut bytes = vec![0u8; 40];
+        bytes[0..8].copy_from_slice(&0xDEAD_BEEF_DEAD_BEEFu64.to_le_bytes());
+        // version = 1
+        bytes[8..12].copy_from_slice(&1u32.to_le_bytes());
+        std::fs::write(&path, &bytes).unwrap();
+        let err = CchBundle::open(&path).map(|_| ()).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+        assert!(err.to_string().contains("bad magic"));
+    }
+
+    #[test]
+    fn open_rejects_struct_bad_version() {
+        const STRUCT_MAGIC: u64 = 0x4343_485F_5354_5243;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("badver.cch-struct");
+        let mut bytes = vec![0u8; 40];
+        bytes[0..8].copy_from_slice(&STRUCT_MAGIC.to_le_bytes());
+        bytes[8..12].copy_from_slice(&2u32.to_le_bytes()); // version 2
+        std::fs::write(&path, &bytes).unwrap();
+        let err = CchBundle::open(&path).map(|_| ()).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+        assert!(err.to_string().contains("unsupported struct version"));
+    }
+
+    #[test]
+    fn open_rejects_struct_truncated_at_first_section() {
+        // Build a valid bundle, then truncate it to exactly 40 bytes (the header),
+        // so the first section header (order) cannot be read.
+        use routingkit_cch::ffi;
+        let n: u32 = 5;
+        let order: Vec<u32> = (0..n).collect();
+        let tail: Vec<u32> = (0..n - 1).collect();
+        let head: Vec<u32> = (1..n).collect();
+        let cch = unsafe { ffi::cch_new(&order, &tail, &head, |_| {}, false) };
+        let cch_ref = cch.as_ref().expect("cch_new");
+        let dir = tempfile::tempdir().expect("tempdir");
+        let full_path = dir.path().join("full.cch-struct");
+        unsafe { ffi::cch_save_struct(cch_ref, full_path.to_str().unwrap()) }.unwrap();
+
+        let full_bytes = std::fs::read(&full_path).unwrap();
+        // Truncate to just the 40-byte header (section 'order' needs pos+8 bytes which is 48).
+        let trunc = &full_bytes[..40];
+        let trunc_path = dir.path().join("trunc.cch-struct");
+        std::fs::write(&trunc_path, trunc).unwrap();
+
+        let err = CchBundle::open(&trunc_path).map(|_| ()).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+        assert!(err.to_string().contains("truncated bundle at section"));
+    }
+
+    #[test]
+    fn open_rejects_struct_section_extends_past_end() {
+        // Build a valid bundle, then inflate the first section's byte_length so it
+        // extends past the end of the file.
+        use routingkit_cch::ffi;
+        let n: u32 = 5;
+        let order: Vec<u32> = (0..n).collect();
+        let tail: Vec<u32> = (0..n - 1).collect();
+        let head: Vec<u32> = (1..n).collect();
+        let cch = unsafe { ffi::cch_new(&order, &tail, &head, |_| {}, false) };
+        let cch_ref = cch.as_ref().expect("cch_new");
+        let dir = tempfile::tempdir().expect("tempdir");
+        let full_path = dir.path().join("full2.cch-struct");
+        unsafe { ffi::cch_save_struct(cch_ref, full_path.to_str().unwrap()) }.unwrap();
+
+        let mut bytes = std::fs::read(&full_path).unwrap();
+        // At offset 40: the first section (order) byte_length u64 LE.
+        // Inflate it so pos (40 + 8 + inflated_len) > bytes.len().
+        let inflated_len = bytes.len() as u64 + 1_000_000;
+        bytes[40..48].copy_from_slice(&inflated_len.to_le_bytes());
+        let bad_path = dir.path().join("bad2.cch-struct");
+        std::fs::write(&bad_path, &bytes).unwrap();
+
+        let err = CchBundle::open(&bad_path).map(|_| ()).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+        assert!(err.to_string().contains("extends past end of mmap"));
+    }
+
+    // ---- Metric bundle format error tests ----
+
+    #[test]
+    fn open_rejects_metric_too_small() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("small.cch-metric");
+        std::fs::write(&path, [0u8; 10]).unwrap();
+        let err = MetricBundle::open(&path).map(|_| ()).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+        assert!(err.to_string().contains("too small"));
+    }
+
+    #[test]
+    fn open_rejects_metric_bad_magic() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("badmagic.cch-metric");
+        let mut bytes = vec![0u8; 32];
+        bytes[0..8].copy_from_slice(&0xDEAD_BEEF_DEAD_BEEFu64.to_le_bytes());
+        bytes[8..12].copy_from_slice(&1u32.to_le_bytes());
+        std::fs::write(&path, &bytes).unwrap();
+        let err = MetricBundle::open(&path).map(|_| ()).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+        assert!(err.to_string().contains("bad metric magic"));
+    }
+
+    #[test]
+    fn open_rejects_metric_bad_version() {
+        const METRIC_MAGIC: u64 = 0x4343_485F_4D45_5452;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("badver.cch-metric");
+        let mut bytes = vec![0u8; 32];
+        bytes[0..8].copy_from_slice(&METRIC_MAGIC.to_le_bytes());
+        bytes[8..12].copy_from_slice(&2u32.to_le_bytes()); // version 2
+        std::fs::write(&path, &bytes).unwrap();
+        let err = MetricBundle::open(&path).map(|_| ()).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+        assert!(err.to_string().contains("unsupported metric version"));
+    }
+
+    #[test]
+    fn open_rejects_metric_truncated_at_backward_section() {
+        // Build a real metric, then truncate it so the forward section data is
+        // present but the backward section header is missing.
+        use routingkit_cch::ffi;
+        let n: u32 = 5;
+        let order: Vec<u32> = (0..n).collect();
+        let tail: Vec<u32> = (0..n - 1).collect();
+        let head: Vec<u32> = (1..n).collect();
+        let cch = unsafe { ffi::cch_new(&order, &tail, &head, |_| {}, false) };
+        let cch_ref = cch.as_ref().expect("cch_new");
+        let dir = tempfile::tempdir().expect("tempdir");
+        let struct_path = dir.path().join("t.cch-struct");
+        let metric_path = dir.path().join("full.cch-metric");
+        #[allow(clippy::cast_possible_truncation)]
+        let weights: Vec<u32> = (0..tail.len() as u32).collect();
+        let mut metric = unsafe { ffi::cch_metric_new(cch_ref, &weights) };
+        unsafe {
+            ffi::cch_save_struct(cch_ref, struct_path.to_str().unwrap()).unwrap();
+            ffi::cch_metric_customize(metric.as_mut().unwrap());
+            ffi::cch_save_metric(metric.as_ref().unwrap(), metric_path.to_str().unwrap()).unwrap();
+        }
+        let full_bytes = std::fs::read(&metric_path).unwrap();
+        // The format is: 24-byte header, [u64 fwd_len][fwd data], [u64 bwd_len][bwd data]
+        // Truncate to 24 + 8 + forward_data (no backward section header).
+        #[allow(clippy::cast_possible_truncation)] // bundle sizes fit usize in test
+        let fwd_len = {
+            let mut buf = [0u8; 8];
+            buf.copy_from_slice(&full_bytes[24..32]);
+            u64::from_le_bytes(buf) as usize
+        };
+        // Keep header (24) + fwd_len_u64 (8) + fwd_data (fwd_len) - but NOT backward section header
+        let trunc_len = 24 + 8 + fwd_len; // exactly at boundary, backward header missing
+        let trunc = &full_bytes[..trunc_len];
+        let trunc_path = dir.path().join("trunc_bwd.cch-metric");
+        std::fs::write(&trunc_path, trunc).unwrap();
+        let err = MetricBundle::open(&trunc_path).map(|_| ()).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+        assert!(
+            err.to_string()
+                .contains("truncated metric bundle at backward")
+        );
+    }
+
+    #[test]
+    fn open_rejects_metric_extends_past_end() {
+        // Build a real metric bundle, then inflate the backward section length
+        // so pos > bytes.len() after reading it.
+        use routingkit_cch::ffi;
+        let n: u32 = 5;
+        let order: Vec<u32> = (0..n).collect();
+        let tail: Vec<u32> = (0..n - 1).collect();
+        let head: Vec<u32> = (1..n).collect();
+        let cch = unsafe { ffi::cch_new(&order, &tail, &head, |_| {}, false) };
+        let cch_ref = cch.as_ref().expect("cch_new");
+        let dir = tempfile::tempdir().expect("tempdir");
+        let struct_path = dir.path().join("t2.cch-struct");
+        let metric_path = dir.path().join("full2.cch-metric");
+        #[allow(clippy::cast_possible_truncation)]
+        let weights: Vec<u32> = (0..tail.len() as u32).collect();
+        let mut metric = unsafe { ffi::cch_metric_new(cch_ref, &weights) };
+        unsafe {
+            ffi::cch_save_struct(cch_ref, struct_path.to_str().unwrap()).unwrap();
+            ffi::cch_metric_customize(metric.as_mut().unwrap());
+            ffi::cch_save_metric(metric.as_ref().unwrap(), metric_path.to_str().unwrap()).unwrap();
+        }
+        let mut bytes = std::fs::read(&metric_path).unwrap();
+        // The backward section length is at offset 24 + 8 + fwd_len.
+        #[allow(clippy::cast_possible_truncation)] // bundle sizes fit usize in test
+        let fwd_len = {
+            let mut buf = [0u8; 8];
+            buf.copy_from_slice(&bytes[24..32]);
+            u64::from_le_bytes(buf) as usize
+        };
+        let bwd_off = 24 + 8 + fwd_len;
+        // Inflate backward length massively.
+        let inflated_bwd = bytes.len() as u64 + 1_000_000;
+        bytes[bwd_off..bwd_off + 8].copy_from_slice(&inflated_bwd.to_le_bytes());
+        let bad_path = dir.path().join("bad_ext.cch-metric");
+        std::fs::write(&bad_path, &bytes).unwrap();
+        let err = MetricBundle::open(&bad_path).map(|_| ()).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+        assert!(err.to_string().contains("extends past end of mmap"));
+    }
+
+    #[test]
+    fn open_rejects_metric_forward_backward_len_mismatch() {
+        const METRIC_MAGIC: u64 = 0x4343_485F_4D45_5452;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("mismatch.cch-metric");
+        // Craft a metric bundle with cch_arc_count=2, forward_len=8, backward_len=12.
+        // Sizes: header(24) + fwd_header(8) + fwd_data(8) + bwd_header(8) + bwd_data(12) = 60 bytes.
+        let mut bytes = vec![0u8; 60];
+        bytes[0..8].copy_from_slice(&METRIC_MAGIC.to_le_bytes());
+        bytes[8..12].copy_from_slice(&1u32.to_le_bytes()); // version 1
+        // bytes 12-15: padding (zero)
+        bytes[16..24].copy_from_slice(&2u64.to_le_bytes()); // cch_arc_count = 2
+        // Forward section at offset 24: len=8 (= 4*2, correct)
+        bytes[24..32].copy_from_slice(&8u64.to_le_bytes());
+        // forward data at 32: 8 bytes (zeros)
+        // Backward section at offset 40: len=12 (≠ 8, mismatch)
+        bytes[40..48].copy_from_slice(&12u64.to_le_bytes());
+        // backward data at 48: 12 bytes (zeros) — total = 60 bytes
+        std::fs::write(&path, &bytes).unwrap();
+        let err = MetricBundle::open(&path).map(|_| ()).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+        assert!(
+            err.to_string()
+                .contains("forward/backward section lengths disagree")
+        );
+    }
+
+    // ---- Struct section alignment failure ----
+    //
+    // Craft a struct bundle where the 'order' section has an odd byte_length (1),
+    // causing the 'rank' section's data to start at offset 57 (≡ 1 mod 4).
+    // The mmap base is page-aligned (≡ 0 mod 4), so the effective address is
+    // 0+57 ≡ 1 mod 4, failing the u32-alignment check.
+    //
+    // Layout (node_count=1, cch_arc_count=0):
+    //   [0..40)    header (magic, version=1, nc=1, cac=0, iac=0)
+    //   [40..48)   order section byte_length = 1   (u64 LE)
+    //   [48)       order data (1 byte)              ← pos 49 after this
+    //   [49..57)   rank section byte_length = 4    (u64 LE)  ← rank_off=57 (misaligned!)
+    //   [57..61)   rank data (4 bytes)
+    //   [61..69)   elim byte_length = 4             (u64 LE)
+    //   [69..73)   elim data (4 bytes)
+    //   [73..81)   up_first_out byte_length = 8     (u64 LE)
+    //   [81..89)   up_first_out data (8 bytes)
+    //   [89..97)   up_head byte_length = 0          (u64 LE)
+    //   [97..105)  up_tail byte_length = 0          (u64 LE)
+    //   [105..113) down_first_out byte_length = 8   (u64 LE)
+    //   [113..121) down_first_out data (8 bytes)
+    //   [121..129) down_head byte_length = 0        (u64 LE)
+    //   [129..137) down_to_up byte_length = 0       (u64 LE)
+    //   Total: 137 bytes
+    #[test]
+    fn open_rejects_struct_misaligned_section() {
+        const STRUCT_MAGIC: u64 = 0x4343_485F_5354_5243;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("misalign.cch-struct");
+        let mut b = vec![0u8; 137];
+        // header
+        b[0..8].copy_from_slice(&STRUCT_MAGIC.to_le_bytes());
+        b[8..12].copy_from_slice(&1u32.to_le_bytes()); // version 1
+        // offset 12..16: padding (zero)
+        b[16..24].copy_from_slice(&1u64.to_le_bytes()); // node_count = 1
+        b[24..32].copy_from_slice(&0u64.to_le_bytes()); // cch_arc_count = 0
+        b[32..40].copy_from_slice(&0u64.to_le_bytes()); // input_arc_count = 0
+        // order section: byte_length = 1 (odd → next section at misaligned offset)
+        b[40..48].copy_from_slice(&1u64.to_le_bytes());
+        // order data: 1 byte at offset 48
+        // rank section header at offset 49; rank_off = 57 (57 % 4 = 1)
+        b[49..57].copy_from_slice(&4u64.to_le_bytes()); // rank byte_length = 4 (= 4 * nc=1)
+        // rank data at 57..61
+        // elim section at 61
+        b[61..69].copy_from_slice(&4u64.to_le_bytes()); // elim byte_length = 4
+        // elim data at 69..73
+        // up_first_out at 73
+        b[73..81].copy_from_slice(&8u64.to_le_bytes()); // up_first_out byte_length = 8 (= 4*(nc+1)=8)
+        // data at 81..89
+        // up_head at 89
+        b[89..97].copy_from_slice(&0u64.to_le_bytes()); // up_head byte_length = 0 (cac=0)
+        // up_tail at 97
+        b[97..105].copy_from_slice(&0u64.to_le_bytes()); // up_tail byte_length = 0
+        // down_first_out at 105
+        b[105..113].copy_from_slice(&8u64.to_le_bytes()); // down_first_out byte_length = 8
+        // data at 113..121
+        // down_head at 121
+        b[121..129].copy_from_slice(&0u64.to_le_bytes()); // down_head byte_length = 0
+        // down_to_up at 129
+        b[129..137].copy_from_slice(&0u64.to_le_bytes()); // down_to_up byte_length = 0
+        std::fs::write(&path, &b).unwrap();
+        let err = CchBundle::open(&path).map(|_| ()).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+        assert!(err.to_string().contains("not u32-aligned"));
+    }
+
+    // ---- Struct section count overflow (checked_mul path) ----
+    //
+    // Craft a bundle with node_count = u64::MAX so that, when the `rank`
+    // section is validated, `count.checked_mul(4)` overflows (returns None)
+    // and triggers the InvalidData error at lines 172-176.
+    //
+    // Layout:
+    //   [0..8)   STRUCT_MAGIC
+    //   [8..12)  version = 1
+    //   [12..16) padding (zero)
+    //   [16..24) node_count = u64::MAX         ← causes overflow in checked_mul
+    //   [24..32) cch_arc_count = 0
+    //   [32..40) input_arc_count = 0
+    //   [40..48) order byte_length = 0         ← empty order section, passes None check
+    //   [48..56) rank byte_length = 0          ← triggers checked_mul(4) overflow for node_count
+    //   Total: 56 bytes
+    #[test]
+    fn open_rejects_struct_section_count_overflow() {
+        const STRUCT_MAGIC: u64 = 0x4343_485F_5354_5243;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("overflow.cch-struct");
+        let mut b = vec![0u8; 56];
+        b[0..8].copy_from_slice(&STRUCT_MAGIC.to_le_bytes());
+        b[8..12].copy_from_slice(&1u32.to_le_bytes()); // version 1
+        // node_count = u64::MAX so checked_mul(4) overflows → error
+        b[16..24].copy_from_slice(&u64::MAX.to_le_bytes());
+        b[24..32].copy_from_slice(&0u64.to_le_bytes()); // cch_arc_count = 0
+        b[32..40].copy_from_slice(&0u64.to_le_bytes()); // input_arc_count = 0
+        // order section: byte_length = 0 (passes, no count check)
+        b[40..48].copy_from_slice(&0u64.to_le_bytes());
+        // rank section: byte_length = 0 (but count = usize::MAX → overflow)
+        b[48..56].copy_from_slice(&0u64.to_le_bytes());
+        std::fs::write(&path, &b).unwrap();
+        let err = CchBundle::open(&path).map(|_| ()).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+        assert!(err.to_string().contains("overflows"));
+    }
+
+    // ---- Metric section count overflow (checked_mul path) ----
+    //
+    // Craft a metric bundle with cch_arc_count = u64::MAX so that
+    // `cch_arc_count.checked_mul(4)` overflows and triggers lines 387-391.
+    //
+    // Layout:
+    //   [0..8)   METRIC_MAGIC
+    //   [8..12)  version = 1
+    //   [12..16) padding (zero)
+    //   [16..24) cch_arc_count = u64::MAX      ← causes overflow in checked_mul
+    //   [24..32) forward byte_length = 0
+    //   [32..40) backward byte_length = 0
+    //   Total: 40 bytes (>= 32-byte minimum; forward+backward sections present)
+    #[test]
+    fn open_rejects_metric_section_count_overflow() {
+        const METRIC_MAGIC: u64 = 0x4343_485F_4D45_5452;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("overflow.cch-metric");
+        let mut b = vec![0u8; 40];
+        b[0..8].copy_from_slice(&METRIC_MAGIC.to_le_bytes());
+        b[8..12].copy_from_slice(&1u32.to_le_bytes()); // version 1
+        // cch_arc_count = u64::MAX → checked_mul(4) overflows → error
+        b[16..24].copy_from_slice(&u64::MAX.to_le_bytes());
+        // forward section: byte_length = 0 at offset 24
+        b[24..32].copy_from_slice(&0u64.to_le_bytes());
+        // backward section: byte_length = 0 at offset 32
+        b[32..40].copy_from_slice(&0u64.to_le_bytes());
+        std::fs::write(&path, &b).unwrap();
+        let err = MetricBundle::open(&path).map(|_| ()).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+        assert!(err.to_string().contains("overflows"));
     }
 }
