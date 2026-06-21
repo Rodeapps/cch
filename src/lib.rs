@@ -17,6 +17,8 @@
 
 #![forbid(unsafe_op_in_unsafe_fn)]
 
+mod internal;
+
 /// `RoutingKit`'s `inf_weight` sentinel for "unreachable".
 ///
 /// Matches `routingkit/include/routingkit/constants.h:7` (`inf_weight = 2_147_483_647 = i32::MAX`).
