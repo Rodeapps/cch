@@ -407,7 +407,7 @@ impl MetricBundle {
         // u32 alignment is guaranteed without a runtime check:
         //   - mmap base is page-aligned (multiple of 4096)
         //   - forward_off = 32 (header 24 B + one 8-B length prefix)
-        //   - backward_off = 32 + 8 + forward_len + 8 = 48 + forward_len
+        //   - backward_off = forward_off + forward_len + 8 = 40 + forward_len
         // forward_len == expected_bytes == 4 * cch_arc_count, always a multiple
         // of 4, so backward_off is also a multiple of 4.
         Ok(MetricBundle {
