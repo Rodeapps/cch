@@ -58,10 +58,10 @@ sizes: 50 for `degree_order`/`customize`, 20 for `build`/`node_path`, 10 for
 | `Cch::build` | 439 µs | 444 µs | ~1.00× (parity) |
 | `customize` | 1.00 ms | 1.00 ms | ~1.00× (parity) |
 | `distance_matrix` (576×576) | 17.98 ms | 12.95 ms | 1.39× (Rust slower) |
-| `node_path` (200 pairs) | 3.71 ms | 3.27 ms | 1.14× (Rust slower) |
+| `node_path` (200 pairs) | 3.55 ms | 2.89 ms | 1.23× (Rust slower) |
 
 `degree_order`, `build`, and `customize` are at parity or faster.  Query
-operations (`distance_matrix`, `node_path`) are 14–39% slower: the Rust
+operations (`distance_matrix`, `node_path`) are 23–39% slower: the Rust
 implementation uses `mmap`-backed `CchView`/`MetricView` with an extra
 indirection layer (pointer-to-mmap-slice), while the C++ oracle operates on
 vectors with direct pointer arithmetic.  This gap is expected to narrow with

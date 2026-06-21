@@ -306,15 +306,19 @@ fn bench_node_path(c: &mut Criterion) {
         });
     });
 
+    // Pre-allocate ONE CCHQuery outside the timed loop; reset and reuse it for
+    // each pair so the C++ side amortizes allocation just like the Rust side does.
+    let mut cpp_query = unsafe { ffi::cch_query_new(cpp_met_ref) };
+
     g.bench_function(BenchmarkId::new("cpp", ""), |b| {
         b.iter(|| {
             for &(src, tgt) in &pairs {
-                let mut q = unsafe { ffi::cch_query_new(black_box(cpp_met_ref)) };
                 unsafe {
-                    ffi::cch_query_add_source(q.as_mut().unwrap(), src, 0);
-                    ffi::cch_query_add_target(q.as_mut().unwrap(), tgt, 0);
-                    ffi::cch_query_run(q.as_mut().unwrap());
-                    black_box(ffi::cch_query_node_path(q.as_ref().unwrap()));
+                    ffi::cch_query_reset(cpp_query.as_mut().unwrap(), cpp_met_ref);
+                    ffi::cch_query_add_source(cpp_query.as_mut().unwrap(), src, 0);
+                    ffi::cch_query_add_target(cpp_query.as_mut().unwrap(), tgt, 0);
+                    ffi::cch_query_run(cpp_query.as_mut().unwrap());
+                    black_box(ffi::cch_query_node_path(cpp_query.as_ref().unwrap()));
                 }
             }
         });
