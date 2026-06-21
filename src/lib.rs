@@ -1,16 +1,20 @@
 //! # cch
 //!
-//! Pure-Rust **Customizable Contraction Hierarchies** (CCH) for fast road routing:
-//! read mmappable, zero-copy bundles and answer shortest-path distance /
-//! distance-matrix queries with shortcut path-unpacking.
+//! Pure-Rust **Customizable Contraction Hierarchies** (CCH) for fast road routing —
+//! the full pipeline in safe Rust, with no C++ or FFI in the published library.
 //!
-//! **Phase 1 (implemented):** query/serve over pre-built bundles — open a
-//! `.cch-struct` + `.cch-metric`, run distance-matrix or node-path queries.
-//! Bundles must be pre-built by an external tool (e.g. `RoutingKit` or the
-//! rapidonkey engine) until Phase 2 adds pure-Rust construction.
+//! **Build** a contraction order ([`degree_order`]) and CCH structure
+//! ([`Cch::build`]), **customize** per metric ([`Cch::customize`]), **serialize**
+//! to mmappable `.cch-struct` / `.cch-metric` bundles ([`Cch::save_struct`] /
+//! [`Metric::save`]), then **serve** zero-copy: open bundles ([`CchBundle`] /
+//! [`MetricBundle`]) and answer shortest-path distance / distance-matrix queries
+//! ([`distance_matrix`]) with shortcut path-unpacking ([`node_path`]). The
+//! construction and bundle format are bit-identical to `RoutingKit`, so bundles
+//! interoperate with existing artifacts.
 //!
-//! **Phase 2 (planned):** pure-Rust bundle construction — contraction order,
-//! CCH structure, per-metric customization, and a bundle writer.
+//! The contraction order currently uses a degree heuristic; inertial-flow
+//! (geometric) ordering, which yields higher-quality hierarchies on road
+//! networks, is a planned enhancement.
 //!
 //! Derives from [RoutingKit](https://github.com/RoutingKit/RoutingKit) (BSD-2-Clause);
 //! see `NOTICE`.
@@ -40,5 +44,5 @@ pub use bundle::{CchBundle, CchView, MetricBundle, MetricView};
 pub use customize::Metric;
 pub use order::degree_order;
 pub use path::node_path;
-pub use query::distance_matrix;
+pub use query::{ElimTreeQuery, distance_matrix};
 pub use structure::Cch;

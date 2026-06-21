@@ -3,15 +3,15 @@
 Pure-Rust **Customizable Contraction Hierarchies** (CCH) — a fast road-routing
 index, in safe idiomatic Rust.
 
-> **Status:**
-> - **Phase 1 (query/serve over bundles) — done.** Open `.cch-struct` /
->   `.cch-metric` bundles and answer distance-matrix + node-path queries. Bundles
->   must be pre-built by an external tool (e.g. RoutingKit, rapidonkey) — see
->   `examples/build_and_query.rs`.
-> - **Phase 2 (pure-Rust construction) — next.** Contraction order, CCH
->   structure, per-metric customization, and a bundle writer in pure Rust.
+> **Status:** the full pure-Rust pipeline is implemented — build a contraction
+> order + CCH structure, customize per metric, write `.cch-struct` /
+> `.cch-metric` bundles, and serve distance-matrix + node-path queries, all with
+> no C++ or FFI in the published library. Construction and the bundle format are
+> bit-identical to RoutingKit (verified against it as a dev-only oracle). See
+> `examples/build_and_query.rs` for the end-to-end flow.
 >
-> APIs will change until `0.1`.
+> The contraction order uses a degree heuristic today; inertial-flow (geometric)
+> ordering is the main planned enhancement. APIs may change until `0.1`.
 
 ## What it does
 
@@ -20,14 +20,15 @@ metric-independent **build** (contraction order + structure), then cheap
 per-metric **customization** (e.g. distance, travel-time), and fast queries.
 This crate provides, in pure Rust:
 
-- **bundles** — open mmappable `.cch-struct` / `.cch-metric` artifacts for
-  zero-copy, memory-bounded serving ✓ *Phase 1*
+- **build** — degree-heuristic contraction order + CCH structure ✓
+- **customize** — per-metric shortcut weights ✓
+- **bundles** — read **and write** mmappable `.cch-struct` / `.cch-metric`
+  artifacts for zero-copy, memory-bounded serving ✓
 - **query** — elimination-tree shortest-path distance + many-to-many distance
-  matrix ✓ *Phase 1*
-- **unpack** — shortcut expansion → node paths (for geometry / turn-by-turn)
-  ✓ *Phase 1*
-- **customize** — per-metric shortcut weights *(Phase 2)*
-- **build** — nested-dissection contraction order + CCH structure *(Phase 2)*
+  matrix ✓
+- **unpack** — shortcut expansion → node paths (for geometry / turn-by-turn) ✓
+- *(planned)* **inertial-flow ordering** — geometric nested dissection for
+  higher-quality hierarchies on road networks
 
 ## Why
 
@@ -36,8 +37,8 @@ Existing high-quality CCH implementations are C++ (notably
 library has no C++ or FFI in its runtime dependencies, so downstream Rust
 services embed it without a C++ toolchain. A C++ RoutingKit oracle is used
 only as a dev-only differential-test dependency (not compiled by consumers).
-Today the crate reads pre-built bundles; pure-Rust bundle construction arrives
-in Phase 2.
+The crate builds, customizes, writes, and serves CCH bundles entirely in Rust,
+bit-identical to RoutingKit.
 
 ## Performance vs RoutingKit
 
