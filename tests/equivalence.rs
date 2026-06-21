@@ -790,3 +790,322 @@ fn writer_cross_compat_oracle_loads_rust_files() {
         "node path from rust-written bundle must match direct oracle"
     );
 }
+
+// ============================================================================
+// Part F — end-to-end pure-Rust CCH == C++ oracle (THE HEADLINE GATE).
+//
+// For each fixture we run the FULL Rust pipeline:
+//   degree_order → Cch::build → customize → save_struct/save →
+//   CchBundle::open + MetricBundle::open → distance_matrix (all pairs) +
+//   node_path (200 deterministic LCG pairs)
+//
+// And the FULL oracle pipeline:
+//   cch_new (using the SAME Rust degree_order) → cch_metric_new + customize →
+//   cch_compute_distance_matrix (all pairs) + cch_query_node_path (200 pairs)
+//
+// Assertions:
+//   1. Full distance matrix equal (sentinel normalization: oracle u32::MAX ⇔
+//      rust INF_WEIGHT).
+//   2. All 200 node paths equal as Option<Vec<u32>> (empty oracle path ⇒ None).
+//   3. For the large fixture: Rust-written files are byte-identical to the
+//      oracle-written files.
+// ============================================================================
+
+/// Run the full end-to-end equivalence gate: pure-Rust pipeline equals the
+/// C++ oracle on the same fixture.
+///
+/// The Rust `degree_order` is computed once and fed to BOTH pipelines, so the
+/// comparison isolates build/customize/query logic, not order choice.
+#[allow(clippy::cast_possible_truncation)] // node_count-derived pair indices fit u32
+#[allow(clippy::too_many_lines)] // a faithful end-to-end gate; splitting obscures the flow
+#[allow(clippy::many_single_char_names)] // conventional short names in CCH/LCG context
+fn assert_e2e_pipeline_equal(
+    name: &str,
+    node_count: u32,
+    tail: &[u32],
+    head: &[u32],
+    weights: &[u32],
+    also_byte_identical: bool,
+) {
+    // ---- Shared: compute degree_order once, use on both sides. ----
+    let graph = csr_from_arcs(node_count, tail, head);
+    let order = cch::degree_order(&graph);
+
+    let dir = tempfile::tempdir().expect("tempdir");
+
+    // ---- Rust pipeline ----
+    let rust_cch = cch::Cch::build(&graph, &order);
+    let rust_met = rust_cch.customize(weights);
+
+    let rust_struct_path = dir.path().join("rust_e2e.cch-struct");
+    let rust_metric_path = dir.path().join("rust_e2e.cch-metric");
+    rust_cch
+        .save_struct(&rust_struct_path)
+        .expect("Cch::save_struct");
+    rust_met.save(&rust_metric_path).expect("Metric::save");
+
+    let rust_cch_bundle = cch::bundle::CchBundle::open(&rust_struct_path).expect("CchBundle::open");
+    let rust_met_bundle =
+        cch::bundle::MetricBundle::open(&rust_metric_path).expect("MetricBundle::open");
+    let cv = rust_cch_bundle.view();
+    let mv = rust_met_bundle.view();
+
+    // distance_matrix: all pairs
+    let pair_n = node_count as usize;
+    let all_nodes: Vec<u32> = (0..node_count).collect();
+    let rust_dm = cch::distance_matrix(&cv, &mv, &all_nodes, &all_nodes);
+
+    // node_path: 200 LCG pairs
+    let mut rust_paths: Vec<Option<Vec<u32>>> = Vec::with_capacity(200);
+    let mut lcg_seed: u64 = 0x9E37_79B9_7F4A_7C15;
+    for _ in 0..200 {
+        lcg_seed = lcg_seed
+            .wrapping_mul(6_364_136_223_846_793_005)
+            .wrapping_add(1_442_695_040_888_963_407);
+        let src = ((lcg_seed >> 33) as u32) % node_count;
+        lcg_seed = lcg_seed
+            .wrapping_mul(6_364_136_223_846_793_005)
+            .wrapping_add(1_442_695_040_888_963_407);
+        let tgt = ((lcg_seed >> 33) as u32) % node_count;
+        rust_paths.push(cch::node_path(&cv, &mv, src, tgt));
+    }
+
+    // ---- Oracle pipeline (uses the same order!) ----
+    let oracle_cch = unsafe { ffi::cch_new(&order, tail, head, |_| {}, false) };
+    let oracle_cch_ref = oracle_cch.as_ref().expect("oracle cch_new null");
+
+    let oracle_struct_path = dir.path().join("oracle_e2e.cch-struct");
+    let oracle_metric_path = dir.path().join("oracle_e2e.cch-metric");
+
+    let mut oracle_metric = unsafe { ffi::cch_metric_new(oracle_cch_ref, weights) };
+    unsafe {
+        ffi::cch_save_struct(oracle_cch_ref, oracle_struct_path.to_str().unwrap())
+            .expect("cch_save_struct");
+        ffi::cch_metric_customize(oracle_metric.as_mut().expect("metric pin"));
+        ffi::cch_save_metric(
+            oracle_metric.as_ref().expect("metric ref"),
+            oracle_metric_path.to_str().unwrap(),
+        )
+        .expect("cch_save_metric");
+    }
+    let oracle_met_ref = oracle_metric.as_ref().expect("oracle metric ref");
+
+    let oracle_dm =
+        unsafe { ffi::cch_compute_distance_matrix(oracle_met_ref, &all_nodes, &all_nodes) };
+
+    // ---- Assert distance matrix equal ----
+    assert_eq!(
+        oracle_dm.len(),
+        rust_dm.len(),
+        "[{name}] distance matrix length mismatch"
+    );
+    for k in 0..oracle_dm.len() {
+        let ov = oracle_dm[k];
+        let rv = rust_dm[k];
+        let oracle_inf = ov == u32::MAX || ov == cch::INF_WEIGHT;
+        let rust_inf = rv == cch::INF_WEIGHT;
+        let row = k / pair_n;
+        let col = k % pair_n;
+        assert_eq!(
+            oracle_inf, rust_inf,
+            "[{name}] reachability mismatch at ({row},{col}): oracle={ov}, rust={rv}"
+        );
+        if !oracle_inf && !rust_inf {
+            assert_eq!(
+                ov, rv,
+                "[{name}] distance mismatch at ({row},{col}): oracle={ov}, rust={rv}"
+            );
+        }
+    }
+
+    // ---- Assert 200 node paths equal ----
+    let mut lcg_seed2: u64 = 0x9E37_79B9_7F4A_7C15;
+    for (pair_idx, rust_path) in rust_paths.into_iter().enumerate() {
+        lcg_seed2 = lcg_seed2
+            .wrapping_mul(6_364_136_223_846_793_005)
+            .wrapping_add(1_442_695_040_888_963_407);
+        let src = ((lcg_seed2 >> 33) as u32) % node_count;
+        lcg_seed2 = lcg_seed2
+            .wrapping_mul(6_364_136_223_846_793_005)
+            .wrapping_add(1_442_695_040_888_963_407);
+        let tgt = ((lcg_seed2 >> 33) as u32) % node_count;
+
+        let mut oracle_q = unsafe { ffi::cch_query_new(oracle_met_ref) };
+        let oracle_path_vec: Vec<u32> = unsafe {
+            ffi::cch_query_add_source(oracle_q.as_mut().unwrap(), src, 0);
+            ffi::cch_query_add_target(oracle_q.as_mut().unwrap(), tgt, 0);
+            ffi::cch_query_run(oracle_q.as_mut().unwrap());
+            ffi::cch_query_node_path(oracle_q.as_ref().unwrap())
+        };
+        let oracle_path: Option<Vec<u32>> =
+            (!oracle_path_vec.is_empty()).then_some(oracle_path_vec);
+
+        assert_eq!(
+            rust_path, oracle_path,
+            "[{name}] path mismatch at pair {pair_idx} ({src}→{tgt})"
+        );
+    }
+
+    // ---- Byte-identical writer check (for the larger fixture) ----
+    if also_byte_identical {
+        let oracle_struct_bytes = std::fs::read(&oracle_struct_path).expect("read oracle struct");
+        let rust_struct_bytes = std::fs::read(&rust_struct_path).expect("read rust struct");
+        assert_eq!(
+            oracle_struct_bytes.len(),
+            rust_struct_bytes.len(),
+            "[{name}] struct byte lengths differ: oracle={} rust={}",
+            oracle_struct_bytes.len(),
+            rust_struct_bytes.len()
+        );
+        if oracle_struct_bytes != rust_struct_bytes {
+            let first = oracle_struct_bytes
+                .iter()
+                .zip(&rust_struct_bytes)
+                .position(|(x, y)| x != y)
+                .expect("lengths equal but bytes differ");
+            panic!(
+                "[{name}] struct bytes differ at offset {first}: \
+                 oracle={:#04x} rust={:#04x}",
+                oracle_struct_bytes[first], rust_struct_bytes[first]
+            );
+        }
+        let oracle_metric_bytes = std::fs::read(&oracle_metric_path).expect("read oracle metric");
+        let rust_metric_bytes = std::fs::read(&rust_metric_path).expect("read rust metric");
+        assert_eq!(
+            oracle_metric_bytes.len(),
+            rust_metric_bytes.len(),
+            "[{name}] metric byte lengths differ"
+        );
+        if oracle_metric_bytes != rust_metric_bytes {
+            let first = oracle_metric_bytes
+                .iter()
+                .zip(&rust_metric_bytes)
+                .position(|(x, y)| x != y)
+                .expect("lengths equal but bytes differ");
+            panic!(
+                "[{name}] metric bytes differ at offset {first}: \
+                 oracle={:#04x} rust={:#04x}",
+                oracle_metric_bytes[first], rust_metric_bytes[first]
+            );
+        }
+    }
+}
+
+// ----------------------------------------------------------------------------
+// E2E Fixture 1: bidirectional path, 5 nodes (small, fast).
+// ----------------------------------------------------------------------------
+#[test]
+fn e2e_pipeline_path_5() {
+    let n = 5u32;
+    // Grouped by tail (required for csr_from_arcs round-trip identity).
+    let tail = vec![0u32, 1, 1, 2, 2, 3, 3, 4];
+    let head = vec![1u32, 0, 2, 1, 3, 2, 4, 3];
+    let weights = vec![10u32, 11, 20, 21, 30, 31, 40, 41];
+    assert_e2e_pipeline_equal("path_5", n, &tail, &head, &weights, false);
+}
+
+// ----------------------------------------------------------------------------
+// E2E Fixture 2: fill-in graph (star around node 0), 4 nodes.
+// ----------------------------------------------------------------------------
+#[test]
+fn e2e_pipeline_fillin_4() {
+    let n = 4u32;
+    let tail = vec![0u32, 0, 0, 1, 2, 3];
+    let head = vec![1u32, 2, 3, 0, 0, 0];
+    let weights = vec![5u32, 7, 9, 6, 8, 10];
+    assert_e2e_pipeline_equal("fillin_4", n, &tail, &head, &weights, false);
+}
+
+// ----------------------------------------------------------------------------
+// E2E Fixture 3: 3x3 grid, varied weights (small, exercises fill-in).
+// ----------------------------------------------------------------------------
+#[test]
+fn e2e_pipeline_grid_3x3() {
+    let cols = 3u32;
+    let rows = 3u32;
+    let n = cols * rows;
+    let mut tail = Vec::new();
+    let mut head = Vec::new();
+    for r in 0..rows {
+        for c in 0..cols {
+            let v = r * cols + c;
+            if c + 1 < cols {
+                tail.push(v);
+                head.push(v + 1);
+            }
+            if c > 0 {
+                tail.push(v);
+                head.push(v - 1);
+            }
+            if r + 1 < rows {
+                tail.push(v);
+                head.push(v + cols);
+            }
+            if r > 0 {
+                tail.push(v);
+                head.push(v - cols);
+            }
+        }
+    }
+    #[allow(clippy::cast_possible_truncation)]
+    let weights: Vec<u32> = (0..tail.len() as u32).map(|i| (i + 1) * 3).collect();
+    assert_e2e_pipeline_equal("grid_3x3", n, &tail, &head, &weights, false);
+}
+
+// ----------------------------------------------------------------------------
+// E2E Fixture 4: 24×24 bidirectional grid (≈576 nodes, CCH arc count > 512).
+//
+// This fixture exercises the 512-bit bitvector block boundary in the writer
+// end-to-end. Both the byte-identical struct/metric comparison and the full
+// distance-matrix + 200-path gate are run.
+// ----------------------------------------------------------------------------
+#[test]
+fn e2e_pipeline_grid_24x24_large() {
+    let cols = 24u32;
+    let rows = 24u32;
+    let n = cols * rows; // 576 nodes
+    let mut tail = Vec::new();
+    let mut head = Vec::new();
+    for r in 0..rows {
+        for c in 0..cols {
+            let v = r * cols + c;
+            if c + 1 < cols {
+                tail.push(v);
+                head.push(v + 1);
+            }
+            if c > 0 {
+                tail.push(v);
+                head.push(v - 1);
+            }
+            if r + 1 < rows {
+                tail.push(v);
+                head.push(v + cols);
+            }
+            if r > 0 {
+                tail.push(v);
+                head.push(v - cols);
+            }
+        }
+    }
+    // Deterministic varied weights: arc index + 1, modulo a prime so we get
+    // diverse values without overflow.
+    #[allow(clippy::cast_possible_truncation)]
+    let weights: Vec<u32> = (0..tail.len() as u32)
+        .map(|i| (i * 7 + 1) % 9973 + 1)
+        .collect();
+
+    // Verify CCH arc count exceeds 512 (the 512-bit block boundary).
+    let graph = csr_from_arcs(n, &tail, &head);
+    let order = cch::degree_order(&graph);
+    let c = cch::Cch::build(&graph, &order);
+    assert!(
+        c.cch_arc_count() > 512,
+        "24x24 grid must have >512 CCH arcs (got {})",
+        c.cch_arc_count()
+    );
+
+    // Drop c — assert_e2e_pipeline_equal rebuilds it internally.
+    drop(c);
+
+    assert_e2e_pipeline_equal("grid_24x24", n, &tail, &head, &weights, true);
+}
