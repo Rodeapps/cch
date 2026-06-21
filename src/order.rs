@@ -140,9 +140,9 @@ mod tests {
     //   arc (2,3): deg[2]++, deg[3]++
     //   arc (2,4): deg[2]++, deg[4]++
     //   arc (3,4): deg[3]++, deg[4]++
-    // degrees: [3, 5, 3, 2, 4]
-    // sorted by (deg asc, id asc): node 3 (2), node 0 (3), node 2 (3), node 4 (4), node 1 (5)
-    // expected order: [3, 0, 2, 4, 1]
+    // degrees: [3, 4, 3, 2, 4]
+    // sorted by (deg asc, id asc): node 3 (2), node 0 (3), node 2 (3), node 1 (4), node 4 (4)
+    // expected order: [3, 0, 2, 1, 4]
     // ---------------------------------------------------------------------------
     #[test]
     fn degree_order_matches_cpp_oracle() {
