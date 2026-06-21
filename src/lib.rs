@@ -32,8 +32,10 @@ pub mod graph;
 pub mod order;
 pub mod path;
 pub mod query;
+pub mod structure;
 
 pub use bundle::{CchBundle, CchView, MetricBundle, MetricView};
 pub use order::degree_order;
 pub use path::node_path;
 pub use query::distance_matrix;
+pub use structure::Cch;
