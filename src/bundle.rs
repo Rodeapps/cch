@@ -297,6 +297,16 @@ impl CchBundle {
     pub fn cch_arc_count(&self) -> usize {
         self.cch_arc_count
     }
+
+    /// The raw mmap-backed file bytes.
+    ///
+    /// Exposed for residency / telemetry use (e.g. `mincore(2)` over the
+    /// mapped region). The returned slice spans the entire mapping; its
+    /// `as_ptr()`/`len()` are the page-aligned base and length of the mmap.
+    #[must_use]
+    pub fn mmap_bytes(&self) -> &[u8] {
+        &self.mmap
+    }
 }
 
 /// Mmap-backed owner for a `.cch-metric-*` bundle.
@@ -444,6 +454,12 @@ impl MetricBundle {
     #[must_use]
     pub fn cch_arc_count(&self) -> usize {
         self.cch_arc_count
+    }
+
+    /// The raw mmap-backed file bytes (see [`CchBundle::mmap_bytes`]).
+    #[must_use]
+    pub fn mmap_bytes(&self) -> &[u8] {
+        &self.mmap
     }
 }
 
@@ -669,6 +685,16 @@ mod tests {
             expected_arc_count,
             "metric backward len should match CCH arc count"
         );
+
+        // mmap_bytes() spans the entire mapped file (for residency/telemetry).
+        let struct_file_len =
+            usize::try_from(std::fs::metadata(&struct_path).unwrap().len()).unwrap();
+        assert_eq!(struct_bundle.mmap_bytes().len(), struct_file_len);
+        assert!(!struct_bundle.mmap_bytes().is_empty());
+        let metric_file_len =
+            usize::try_from(std::fs::metadata(&metric_path).unwrap().len()).unwrap();
+        assert_eq!(mbundle.mmap_bytes().len(), metric_file_len);
+        assert!(!mbundle.mmap_bytes().is_empty());
     }
 
     // ---- CchView::cch_arc_count and CchBundle node_count/cch_arc_count ----
