@@ -830,6 +830,33 @@ fn assert_e2e_pipeline_equal(
     // ---- Shared: compute degree_order once, use on both sides. ----
     let graph = csr_from_arcs(node_count, tail, head);
     let order = cch::degree_order(&graph);
+    assert_e2e_pipeline_equal_with_order(
+        name,
+        node_count,
+        tail,
+        head,
+        weights,
+        &order,
+        also_byte_identical,
+    );
+}
+
+/// Like [`assert_e2e_pipeline_equal`] but with an explicit contraction order
+/// used on BOTH the Rust and the oracle pipelines. Any valid order yields
+/// correct shortest paths, so equality confirms the pipeline is order-agnostic
+/// (here: that the Rust inertial order drives a correct pipeline).
+#[allow(clippy::too_many_lines, clippy::too_many_arguments)]
+fn assert_e2e_pipeline_equal_with_order(
+    name: &str,
+    node_count: u32,
+    tail: &[u32],
+    head: &[u32],
+    weights: &[u32],
+    order: &[u32],
+    also_byte_identical: bool,
+) {
+    let graph = csr_from_arcs(node_count, tail, head);
+    let order = order.to_vec();
 
     let dir = tempfile::tempdir().expect("tempdir");
 
@@ -1108,4 +1135,198 @@ fn e2e_pipeline_grid_24x24_large() {
     drop(c);
 
     assert_e2e_pipeline_equal("grid_24x24", n, &tail, &head, &weights, true);
+}
+
+// ============================================================================
+// Part C — inertial-flow nested-dissection order (Task 8b.3).
+//
+// GATE: valid permutation + end-to-end shortest-path correctness with the Rust
+// inertial order + CCH shortcut-count QUALITY comparable to the oracle's
+// inertial order and dramatically better than degree order.
+// ============================================================================
+
+/// Build an undirected `rows x cols` grid: bidirectional arcs grouped by tail,
+/// plus per-node coordinates `lat = row`, `lon = col`.
+///
+/// Returns `(node_count, tail, head, latitude, longitude)`.
+#[allow(clippy::cast_precision_loss)]
+fn build_grid(rows: u32, cols: u32) -> (u32, Vec<u32>, Vec<u32>, Vec<f32>, Vec<f32>) {
+    let n = rows * cols;
+    let mut tail = Vec::new();
+    let mut head = Vec::new();
+    let mut latitude = vec![0.0f32; n as usize];
+    let mut longitude = vec![0.0f32; n as usize];
+    for r in 0..rows {
+        for c in 0..cols {
+            let v = r * cols + c;
+            latitude[v as usize] = r as f32;
+            longitude[v as usize] = c as f32;
+            // Emit each node's incident arcs (grouped by tail), both directions.
+            if c + 1 < cols {
+                tail.push(v);
+                head.push(v + 1);
+            }
+            if c > 0 {
+                tail.push(v);
+                head.push(v - 1);
+            }
+            if r + 1 < rows {
+                tail.push(v);
+                head.push(v + cols);
+            }
+            if r > 0 {
+                tail.push(v);
+                head.push(v - cols);
+            }
+        }
+    }
+    (n, tail, head, latitude, longitude)
+}
+
+/// GATE 1: `inertial_order` is a valid permutation of `0..node_count` on several
+/// graphs (a grid, a path, and a disconnected graph).
+#[test]
+fn inertial_order_is_valid_permutation() {
+    let check = |label: &str, n: u32, tail: &[u32], head: &[u32], lat: &[f32], lon: &[f32]| {
+        let order = cch::inertial_order(n, tail, head, lat, lon);
+        assert_eq!(order.len(), n as usize, "[{label}] order length");
+        let mut sorted = order.clone();
+        sorted.sort_unstable();
+        let expected: Vec<u32> = (0..n).collect();
+        assert_eq!(sorted, expected, "[{label}] must be a permutation of 0..n");
+    };
+
+    // A grid.
+    let (n, tail, head, lat, lon) = build_grid(6, 5);
+    check("grid_6x5", n, &tail, &head, &lat, &lon);
+
+    // A path 0-1-...-9.
+    let n = 10u32;
+    let mut tail = Vec::new();
+    let mut head = Vec::new();
+    for v in 0..n - 1 {
+        tail.push(v);
+        head.push(v + 1);
+        tail.push(v + 1);
+        head.push(v);
+    }
+    #[allow(clippy::cast_precision_loss)]
+    let lat: Vec<f32> = (0..n).map(|v| v as f32).collect();
+    let lon = vec![0.0f32; n as usize];
+    check("path_10", n, &tail, &head, &lat, &lon);
+
+    // A disconnected graph: two separate triangles.
+    let n = 6u32;
+    let tail = vec![0u32, 1, 2, 0, 1, 2, 3, 4, 5, 3, 4, 5];
+    let head = vec![1u32, 2, 0, 2, 0, 1, 4, 5, 3, 5, 3, 4];
+    let lat = vec![0.0f32, 0.0, 1.0, 10.0, 10.0, 11.0];
+    let lon = vec![0.0f32, 1.0, 0.0, 0.0, 1.0, 0.0];
+    check("two_triangles", n, &tail, &head, &lat, &lon);
+}
+
+/// GATE 2: end-to-end shortest-path CORRECTNESS using the Rust inertial order.
+///
+/// Runs the full Rust pipeline with the Rust inertial order and compares the
+/// distance matrix + node paths against the oracle pipeline driven by the SAME
+/// Rust inertial order. (Shortest paths are order-independent; this confirms no
+/// pipeline bug with the inertial order.)
+#[test]
+fn inertial_order_e2e_correctness_grid() {
+    let (n, tail, head, lat, lon) = build_grid(10, 10);
+    let order = cch::inertial_order(n, &tail, &head, &lat, &lon);
+
+    // Deterministic varied weights, one per input arc.
+    #[allow(clippy::cast_possible_truncation)]
+    let weights: Vec<u32> = (0..tail.len() as u32)
+        .map(|i| (i * 13 + 1) % 997 + 1)
+        .collect();
+
+    assert_e2e_pipeline_equal_with_order(
+        "inertial_grid_10x10",
+        n,
+        &tail,
+        &head,
+        &weights,
+        &order,
+        false,
+    );
+}
+
+/// GATE 3 (headline): CCH shortcut-count QUALITY.
+///
+/// On a 24x24 grid compare `cch_arc_count()` of:
+///   `R` = `Cch::build`(rust inertial order)
+///   `O` = oracle `cch_new`(`compute_order_inertial` order)
+///   `D` = `Cch::build`(`degree_order`)
+/// Assert `R` ≤ 1.25·`O` (parity with C++ inertial) AND `R` < `D` by a clear margin.
+#[test]
+#[allow(
+    clippy::many_single_char_names,
+    reason = "R/O/D are the conventional names for the three CCH arc counts"
+)]
+fn inertial_order_quality_beats_degree_and_matches_oracle() {
+    let (n, tail, head, lat, lon) = build_grid(24, 24);
+    let graph = csr_from_arcs(n, &tail, &head);
+
+    // R: Rust inertial order.
+    let rust_inertial = cch::inertial_order(n, &tail, &head, &lat, &lon);
+    let r = cch::Cch::build(&graph, &rust_inertial).cch_arc_count() as u64;
+
+    // O: oracle inertial order, oracle CCH.
+    let oracle_inertial = routingkit_cch::compute_order_inertial(n, &tail, &head, &lat, &lon);
+    let oracle_cch = unsafe { ffi::cch_new(&oracle_inertial, &tail, &head, |_| {}, false) };
+    let o = u64::from(unsafe { ffi::cch_arc_count(oracle_cch.as_ref().expect("oracle cch null")) });
+
+    // D: degree order, Rust CCH.
+    let degree = cch::degree_order(&graph);
+    let d = cch::Cch::build(&graph, &degree).cch_arc_count() as u64;
+
+    println!("[quality 24x24 grid] R(rust inertial)={r}  O(oracle inertial)={o}  D(degree)={d}");
+    #[allow(
+        clippy::cast_precision_loss,
+        reason = "arc counts are small; ratios are for diagnostic printing only"
+    )]
+    {
+        println!(
+            "[quality 24x24 grid] R/O = {:.3}   D/R = {:.3}",
+            r as f64 / o as f64,
+            d as f64 / r as f64
+        );
+    }
+
+    // Both inertial orders must be valid permutations.
+    let mut s = rust_inertial.clone();
+    s.sort_unstable();
+    assert_eq!(
+        s,
+        (0..n).collect::<Vec<u32>>(),
+        "rust inertial not a permutation"
+    );
+
+    // Quality parity with the C++ inertial order: R ≤ 1.25·O ⇔ 100·R ≤ 125·O.
+    assert!(
+        100 * r <= 125 * o,
+        "Rust inertial CCH arc count {r} exceeds 1.25 x oracle {o} — investigate the port"
+    );
+    // Inertial must clearly beat degree order on a grid.
+    assert!(
+        r < d,
+        "Rust inertial CCH arc count {r} must be < degree-order count {d}"
+    );
+    // "Clear margin": at least 5% fewer arcs than degree order ⇔ 100·R < 95·D.
+    assert!(
+        100 * r < 95 * d,
+        "Rust inertial ({r}) must beat degree ({d}) by a clear margin (>5%)"
+    );
+}
+
+/// GATE 4: determinism — `inertial_order` returns the same permutation across runs.
+#[test]
+fn inertial_order_determinism() {
+    let (n, tail, head, lat, lon) = build_grid(12, 9);
+    let a = cch::inertial_order(n, &tail, &head, &lat, &lon);
+    let b = cch::inertial_order(n, &tail, &head, &lat, &lon);
+    let c = cch::inertial_order(n, &tail, &head, &lat, &lon);
+    assert_eq!(a, b, "inertial_order not deterministic (run 1 vs 2)");
+    assert_eq!(b, c, "inertial_order not deterministic (run 2 vs 3)");
 }

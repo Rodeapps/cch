@@ -30,6 +30,52 @@ pub fn degree_order(graph: &Graph) -> Vec<u32> {
     order
 }
 
+/// Returns an inertial-flow nested-dissection contraction order.
+///
+/// This is the geometric, high-quality ordering used by `RoutingKit` on road
+/// networks: it recursively bisects the graph with balanced flow cuts taken
+/// along four geometric axes (latitude, longitude, and the two diagonals),
+/// ranking separator vertices highest. On graphs with real spatial structure it
+/// produces dramatically fewer fill-in shortcuts than [`degree_order`].
+///
+/// `tail`/`head` are a directed arc list (treated as undirected for ordering;
+/// self-loops are ignored). `latitude`/`longitude` are per-node coordinates,
+/// indexed by node id (each of length `node_count`).
+///
+/// Returns a permutation of `0..node_count` (the contraction order: position →
+/// node id). The result is deterministic for a given input.
+///
+/// # Panics
+/// Panics if `tail.len() != head.len()`, or if `latitude`/`longitude` are not
+/// each of length `node_count`.
+#[must_use]
+pub fn inertial_order(
+    node_count: u32,
+    tail: &[u32],
+    head: &[u32],
+    latitude: &[f32],
+    longitude: &[f32],
+) -> Vec<u32> {
+    assert_eq!(
+        tail.len(),
+        head.len(),
+        "tail and head must have equal length"
+    );
+    assert_eq!(
+        latitude.len(),
+        node_count as usize,
+        "latitude length must equal node_count"
+    );
+    assert_eq!(
+        longitude.len(),
+        node_count as usize,
+        "longitude length must equal node_count"
+    );
+    nd::inertial::compute_nested_node_dissection_order_using_inertial_flow(
+        node_count, tail, head, latitude, longitude,
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

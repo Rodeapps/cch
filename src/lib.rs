@@ -12,9 +12,10 @@
 //! construction and bundle format are bit-identical to `RoutingKit`, so bundles
 //! interoperate with existing artifacts.
 //!
-//! The contraction order currently uses a degree heuristic; inertial-flow
-//! (geometric) ordering, which yields higher-quality hierarchies on road
-//! networks, is a planned enhancement.
+//! Two contraction-order heuristics are provided: a lightweight degree order
+//! ([`degree_order`]) and inertial-flow (geometric) nested dissection
+//! ([`inertial_order`]), which yields far higher-quality hierarchies on road
+//! networks.
 //!
 //! Derives from [RoutingKit](https://github.com/RoutingKit/RoutingKit) (BSD-2-Clause);
 //! see `NOTICE`.
@@ -42,7 +43,7 @@ mod writer;
 
 pub use bundle::{CchBundle, CchView, MetricBundle, MetricView};
 pub use customize::Metric;
-pub use order::degree_order;
+pub use order::{degree_order, inertial_order};
 pub use path::node_path;
 pub use query::{ElimTreeQuery, distance_matrix};
 pub use structure::Cch;
