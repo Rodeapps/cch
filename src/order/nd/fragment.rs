@@ -200,7 +200,7 @@ pub(crate) fn pick_smaller_side(c: &mut CutSide) {
 
 /// Assign component ids via DFS and compute the inv-pseudo-preorder permutation.
 ///
-/// Returns `(component, inv_pseudo_preorder, component_count)`.
+/// Returns `(component, inv_pseudo_preorder)`.
 fn assign_components(fragment: &GraphFragment) -> (Vec<u32>, Vec<u32>) {
     let node_count = fragment.node_count() as usize;
     let invalid = u32::MAX;
@@ -298,18 +298,20 @@ pub(crate) fn decompose_graph_fragment_into_connected_components(
     for h in &mut fragment.head {
         *h = inv_pseudo_preorder[*h as usize];
     }
-    // apply_inverse_permutation(inv_pseudo_preorder, global_node_id)
+    // apply_inverse_permutation(inv_pseudo_preorder, global_node_id):
+    // result[inv[i]] = old[i]  (scatter, not gather)
     {
         let old = fragment.global_node_id.clone();
-        for (i, g) in fragment.global_node_id.iter_mut().enumerate() {
-            *g = old[inv_pseudo_preorder[i] as usize];
+        for (i, &new_pos) in inv_pseudo_preorder.iter().enumerate() {
+            fragment.global_node_id[new_pos as usize] = old[i];
         }
     }
-    // apply_inverse_permutation(inv_pseudo_preorder, component)
+    // apply_inverse_permutation(inv_pseudo_preorder, component):
+    // result[inv[i]] = old[i]  (scatter, not gather)
     {
         let old_comp = component.clone();
-        for (i, c) in component.iter_mut().enumerate() {
-            *c = old_comp[inv_pseudo_preorder[i] as usize];
+        for (i, &new_pos) in inv_pseudo_preorder.iter().enumerate() {
+            component[new_pos as usize] = old_comp[i];
         }
     }
 
@@ -663,6 +665,64 @@ mod tests {
         assert!(!sep.is_set(0), "node 0 is on the cut side");
         assert!(!sep.is_set(1), "node 1 is on the cut side");
         assert!(!sep.is_set(3), "node 3 has no neighbor on small side");
+    }
+
+    // ── decompose: scatter permutation ──────────────────────────────────
+
+    /// Diamond graph (0-1, 0-2, 1-3, 2-3) decomposes into one component.
+    ///
+    /// The adjacency-consistency invariant must hold: for every local node `i`
+    /// in the result sub-fragment, the set of global IDs of its local
+    /// neighbours must equal the set of global neighbours of
+    /// `global_node_id[i]` in the original graph.
+    ///
+    /// GATHER (`g[i] = old[inv[i]]`) maps local indices to wrong global IDs,
+    /// breaking this invariant.  SCATTER (`result[inv[i]] = old[i]`) is correct.
+    #[test]
+    fn test_scatter_permutation_diamond() {
+        // Diamond: 4 nodes, edges 0-1, 0-2, 1-3, 2-3.
+        let original = make_graph_fragment(4, &[0u32, 0, 1, 2], &[1u32, 2, 3, 3]);
+
+        // Build original adjacency: global_id -> set of global neighbours.
+        let mut orig_adj: Vec<std::collections::BTreeSet<u32>> =
+            vec![std::collections::BTreeSet::new(); 4];
+        for a in 0..original.arc_count() as usize {
+            orig_adj[original.tail[a] as usize].insert(original.head[a]);
+        }
+
+        let parts = decompose_graph_fragment_into_connected_components(original);
+
+        // Diamond is connected -- exactly one component.
+        assert_eq!(parts.len(), 1, "diamond graph must yield 1 component");
+        let frag = &parts[0];
+        assert_eq!(frag.node_count(), 4, "component must have all 4 nodes");
+
+        // global_node_id must be a permutation of 0..4.
+        let mut ids = frag.global_node_id.clone();
+        ids.sort_unstable();
+        assert_eq!(
+            ids,
+            vec![0u32, 1, 2, 3],
+            "global_node_id must be a permutation of 0..4"
+        );
+
+        // Adjacency-consistency: for every local node i, the global IDs of its
+        // local neighbours must equal the original neighbours of global_node_id[i].
+        for i in 0..frag.node_count() as usize {
+            let gid = frag.global_node_id[i];
+            let local_neighbour_globals: std::collections::BTreeSet<u32> = {
+                let from = frag.first_out[i] as usize;
+                let to = frag.first_out[i + 1] as usize;
+                frag.head[from..to]
+                    .iter()
+                    .map(|&lj| frag.global_node_id[lj as usize])
+                    .collect()
+            };
+            assert_eq!(
+                local_neighbour_globals, orig_adj[gid as usize],
+                "local node {i} (global {gid}): neighbour global ids do not match",
+            );
+        }
     }
 
     // ── pick_smaller_side ────────────────────────────────────────────────
