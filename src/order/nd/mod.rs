@@ -8,4 +8,5 @@
 // suppress the dead_code lint here rather than throughout each file.
 #![allow(dead_code)]
 
+pub(crate) mod flow;
 pub(crate) mod fragment;
