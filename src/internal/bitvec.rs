@@ -3,9 +3,9 @@
 /// Bit layout matches `RoutingKit`'s `BitVector`: global bit `g` lives in word
 /// `g / 64` at bit position `g % 64` (LSB-first within each word).
 ///
-/// Only the operations consumed by the CCH construction are provided:
-/// `set`, `reset`, `is_set`, `len`, and `words`.  Rank / select are
-/// deliberately omitted — they are not required by any Phase-2 consumer.
+/// Operations: `set`, `reset`, `is_set`, `len`, `words`, `population_count`,
+/// `inplace_not`.  Rank / select are deliberately omitted — they are not
+/// required by any Phase-2 consumer.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct BitVector {
     words: Vec<u64>,
@@ -69,6 +69,30 @@ impl BitVector {
     #[inline]
     pub(crate) fn words(&self) -> &[u64] {
         &self.words
+    }
+
+    /// Returns the number of bits set to `true` (popcount).
+    ///
+    /// Matches `RoutingKit`'s `BitVector::population_count()`.
+    #[must_use]
+    pub(crate) fn population_count(&self) -> u64 {
+        self.words.iter().map(|w| u64::from(w.count_ones())).sum()
+    }
+
+    /// Flips all `len` bits in-place (bitwise NOT), preserving padding as zero.
+    ///
+    /// Matches `RoutingKit`'s `BitVector::inplace_not()`.
+    pub(crate) fn inplace_not(&mut self) {
+        for w in &mut self.words {
+            *w = !*w;
+        }
+        // Zero out padding bits in the last word.
+        let pad = self.len % 64;
+        if pad != 0 {
+            if let Some(last) = self.words.last_mut() {
+                *last &= (1u64 << pad) - 1;
+            }
+        }
     }
 }
 
@@ -286,5 +310,89 @@ mod tests {
         }
         check_eq(&bv, &reference);
         assert_eq!(bv.words().len(), 1);
+    }
+
+    // ------------------------------------------------------------------
+    // population_count
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn population_count_zero() {
+        assert_eq!(BitVector::new(100).population_count(), 0);
+    }
+
+    #[test]
+    fn population_count_all_set() {
+        let mut bv = BitVector::new(64);
+        for i in 0..64u64 {
+            bv.set(i);
+        }
+        assert_eq!(bv.population_count(), 64);
+    }
+
+    #[test]
+    fn population_count_partial() {
+        let mut bv = BitVector::new(200);
+        // Set bits 0, 63, 64, 127, 128 → 5 bits.
+        for &b in &[0u64, 63, 64, 127, 128] {
+            bv.set(b);
+        }
+        assert_eq!(bv.population_count(), 5);
+    }
+
+    #[test]
+    fn population_count_empty() {
+        assert_eq!(BitVector::new(0).population_count(), 0);
+    }
+
+    // ------------------------------------------------------------------
+    // inplace_not
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn inplace_not_all_zero_becomes_all_one() {
+        let n = 6u64;
+        let mut bv = BitVector::new(n);
+        bv.inplace_not();
+        for i in 0..n {
+            assert!(bv.is_set(i), "bit {i} should be set after NOT");
+        }
+        // Padding bits must remain zero.
+        assert_eq!(bv.words()[0] >> n, 0, "padding bits must be zero");
+    }
+
+    #[test]
+    fn inplace_not_involution() {
+        // NOT(NOT(x)) == x.
+        let n = 130u64;
+        let mut bv = BitVector::new(n);
+        for i in (0..n).step_by(3) {
+            bv.set(i);
+        }
+        let original = bv.clone();
+        bv.inplace_not();
+        bv.inplace_not();
+        assert_eq!(bv, original);
+    }
+
+    #[test]
+    fn inplace_not_exact_word_boundary() {
+        // 64 bits — no padding.
+        let mut bv = BitVector::new(64);
+        bv.set(0);
+        bv.inplace_not();
+        assert!(!bv.is_set(0));
+        assert!(bv.is_set(63));
+    }
+
+    #[test]
+    fn inplace_not_padding_stays_zero() {
+        // 65 bits — 1 padding bit in word 1.
+        let mut bv = BitVector::new(65);
+        bv.inplace_not();
+        // bit 64 is valid and should be set.
+        assert!(bv.is_set(64));
+        // padding bits (65..127) must be zero.
+        assert_eq!(bv.words()[1] >> 1, 0, "padding must remain zero");
     }
 }

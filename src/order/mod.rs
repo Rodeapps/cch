@@ -1,5 +1,7 @@
 //! Contraction order heuristics for CCH construction.
 
+mod nd;
+
 use crate::graph::Graph;
 
 /// Returns a contraction order for `graph` sorted by (degree asc, id asc).
