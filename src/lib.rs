@@ -17,6 +17,38 @@
 //! ([`inertial_order`]), which yields far higher-quality hierarchies on road
 //! networks.
 //!
+//! # Example
+//!
+//! ```
+//! use cch::graph::Graph;
+//! use cch::{distance_matrix, degree_order, node_path, Cch};
+//!
+//! // Input graph in CSR form: a 4-node path 0—1—2—3 with unit-weight arcs.
+//! // (CCH treats the input as symmetric / undirected internally.)
+//! let graph = Graph {
+//!     first_out: vec![0, 1, 2, 3, 3],
+//!     head: vec![1, 2, 3],
+//!     weight: vec![1, 1, 1],
+//! };
+//!
+//! // 1. Compute a contraction order (metric-independent). `degree_order` needs
+//! //    no coordinates; use `inertial_order` for production-quality orders.
+//! let order = degree_order(&graph);
+//!
+//! // 2. Build the CCH structure once.
+//! let cch = Cch::build(&graph, &order);
+//!
+//! // 3. Customize a metric (cheap — repeat this per weight profile).
+//! let metric = cch.customize(&graph.weight);
+//!
+//! // 4. Query, in memory, via zero-copy views.
+//! let dm = distance_matrix(&cch.view(), &metric.view(), &[0], &[3]);
+//! assert_eq!(dm[0], 3); // shortest distance 0 -> 3
+//!
+//! let path = node_path(&cch.view(), &metric.view(), 0, 3);
+//! assert_eq!(path, Some(vec![0, 1, 2, 3])); // unpacked node path
+//! ```
+//!
 //! Derives from [RoutingKit](https://github.com/RoutingKit/RoutingKit) (BSD-2-Clause);
 //! see `NOTICE`.
 

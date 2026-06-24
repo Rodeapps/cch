@@ -6,3 +6,7 @@ Cargo.lock
 
 # Local-only design/plan docs (not part of the published crate)
 /.plans/
+
+# Local-only tooling scratch (not part of the published crate)
+/.superpowers/
+/.claude/

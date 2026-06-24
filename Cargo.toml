@@ -1,14 +1,21 @@
 [package]
 name = "cch"
-version = "0.0.0"
+version = "0.1.0"
 edition = "2024"
 license = "MIT"
-description = "Pure-Rust Customizable Contraction Hierarchies (CCH) for fast road routing"
+description = "Pure-Rust Customizable Contraction Hierarchies (CCH): build, customize, and serve fast shortest-path distance, many-to-many matrix, and path queries on road networks"
 repository = "https://github.com/Rodeapps/cch"
+homepage = "https://github.com/Rodeapps/cch"
+documentation = "https://docs.rs/cch"
 readme = "README.md"
 keywords = ["routing", "cch", "contraction-hierarchies", "shortest-path", "graph"]
-categories = ["algorithms", "science"]
+categories = ["algorithms", "science::geo"]
 rust-version = "1.85"
+
+# The published crate is the pure-Rust engine only. The vendored C++ RoutingKit
+# oracle (a dev-only differential-test dependency) and local tooling are excluded
+# from the package; clone the repo to run the oracle-backed equivalence tests.
+exclude = ["oracle/", ".github/", ".superpowers/", ".plans/", ".claude/"]
 
 [dependencies]
 memmap2 = "0.9"
