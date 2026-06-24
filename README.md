@@ -108,10 +108,10 @@ Indicative numbers, Rust vs the C++ RoutingKit oracle, on a 24×24 bidirectional
 | contraction order | 5.22 µs | 7.10 µs | **0.74×** (faster) |
 | `Cch::build` | 439 µs | 444 µs | ~1.00× (parity) |
 | `customize` | 1.00 ms | 1.00 ms | ~1.00× (parity) |
-| `distance_matrix` (576×576) | 17.98 ms | 12.95 ms | 1.39× |
-| `node_path` (×200) | 3.55 ms | 2.89 ms | 1.23× |
+| `distance_matrix` (576×576) | 12.9 ms | 12.5 ms | ~1.00× (parity) |
+| `node_path` (×200) | 3.11 ms | 3.06 ms | ~1.00× (parity) |
 
-Build, customize and ordering are at parity or faster. The query paths are currently ~20–40% slower — the Rust reader works through an mmap-slice indirection where the C++ uses direct vector pointers — and closing that gap is the main performance item on the roadmap. (Numbers are indicative; hardware is not standardized.)
+Every operation is at parity with (or faster than) RoutingKit. The query paths reach parity by eliding the per-arc bounds checks in the hot relaxation loops — the elision-able accesses via sliced iterators, and the data-dependent distance-array access via a `get_unchecked` guarded by a one-time structural validation. (Numbers are indicative; hardware is not standardized — run `cargo bench` for your own.)
 
 ## Correctness
 

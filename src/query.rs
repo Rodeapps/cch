@@ -54,9 +54,26 @@ pub struct ElimTreeQuery<'a> {
 
 impl<'a> ElimTreeQuery<'a> {
     /// Allocate scratch buffers for a query against `cch`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `cch` is malformed — specifically if any `up_head` value is not
+    /// a valid node id (`>= node_count`). A `CchView` from [`Cch::build`] or a
+    /// [`CchBundle`](crate::CchBundle) always satisfies this.
     #[must_use]
     pub fn new(cch: &'a CchView<'a>) -> Self {
         let n = cch.node_count() as usize;
+        // The hot query loops ([`Self::add_source_and_run`]) use `get_unchecked`
+        // to access `forward_tentative_distance[y]` where `y` is an `up_head`
+        // value. `forward_tentative_distance` is sized to `node_count` below, so
+        // those accesses are sound iff every up-arc head is `< node_count`. A
+        // well-formed CCH guarantees this; validate it once here (O(arc_count),
+        // amortized to ~0 over a distance matrix) so the unchecked accesses are
+        // sound for any `CchView`, however it was constructed.
+        assert!(
+            cch.up_head.iter().all(|&h| (h as usize) < n),
+            "malformed CchView: up_head contains a node id >= node_count"
+        );
         Self {
             cch,
             forward_tentative_distance: vec![INF_WEIGHT; n],
@@ -152,35 +169,55 @@ impl<'a> ElimTreeQuery<'a> {
     /// against the already-pinned targets. After this, the per-target distances
     /// are readable via [`Self::get_distances_to_targets`].
     pub fn add_source_and_run(&mut self, metric: &MetricView, source: u32) {
-        let s = self.cch.rank[source as usize];
+        // Hoist the borrowed slices into locals so the inner loops index plain
+        // `&[u32]`s (no repeated `self.`/`metric.` field derefs) and so we can
+        // slice each node's arc range once and iterate it, which lets the
+        // compiler elide the per-arc bounds checks on `up_head`/weights.
+        let cch = self.cch;
+        let up_first_out = cch.up_first_out;
+        let up_head = cch.up_head;
+        let elim = cch.elimination_tree_parent;
+        let forward = metric.forward;
+        let backward = metric.backward;
+
+        let s = cch.rank[source as usize];
 
         // Walk source ancestors. Initial distance at s is 0; mark ancestors so
         // cleanup can revisit them.
         self.forward_tentative_distance[s as usize] = 0;
         self.active_source_node = s;
         self.has_active_source = true;
-        let mut x = s;
-        // We rely on the fact that elimination_tree_parent[x] > x; the walk
-        // strictly ascends.
-        loop {
-            // Forward relax outgoing arcs from x.
-            let from = self.cch.up_first_out[x as usize] as usize;
-            let to = self.cch.up_first_out[x as usize + 1] as usize;
-            let dx = self.forward_tentative_distance[x as usize];
-            if dx != INF_WEIGHT {
-                for xy in from..to {
-                    let y = self.cch.up_head[xy] as usize;
-                    let candidate = dx.saturating_add(metric.forward[xy]);
-                    if candidate < self.forward_tentative_distance[y] {
-                        self.forward_tentative_distance[y] = candidate;
+        {
+            let dist = &mut self.forward_tentative_distance;
+            let mut x = s;
+            // We rely on the fact that elimination_tree_parent[x] > x; the walk
+            // strictly ascends.
+            loop {
+                // Forward relax outgoing arcs from x.
+                let from = up_first_out[x as usize] as usize;
+                let to = up_first_out[x as usize + 1] as usize;
+                let dx = dist[x as usize];
+                if dx != INF_WEIGHT {
+                    let heads = &up_head[from..to];
+                    let weights = &forward[from..to];
+                    for (&yv, &w) in heads.iter().zip(weights) {
+                        let y = yv as usize;
+                        let candidate = dx.saturating_add(w);
+                        // SAFETY: `y` is an `up_head` value — a valid CCH node id
+                        // `< node_count == dist.len()`, established once by the
+                        // structural validation in `ElimTreeQuery::new`.
+                        let slot = unsafe { dist.get_unchecked_mut(y) };
+                        if candidate < *slot {
+                            *slot = candidate;
+                        }
                     }
                 }
+                let parent = elim[x as usize];
+                if parent == INVALID_ID {
+                    break;
+                }
+                x = parent;
             }
-            let parent = self.cch.elimination_tree_parent[x as usize];
-            if parent == INVALID_ID {
-                break;
-            }
-            x = parent;
         }
         // The source walks all the way to the root (INVALID_ID) for distance
         // queries; reset_source uses active_source_end to bound the cleanup walk.
@@ -195,26 +232,31 @@ impl<'a> ElimTreeQuery<'a> {
             let mut x = t;
             while x != end {
                 self.stack.push(x);
-                x = self.cch.elimination_tree_parent[x as usize];
+                x = elim[x as usize];
             }
         }
 
         // Pop the stack, relax incoming arcs from each node.
+        let dist = &mut self.forward_tentative_distance;
         while let Some(x) = self.stack.pop() {
-            let from = self.cch.up_first_out[x as usize] as usize;
-            let to = self.cch.up_first_out[x as usize + 1] as usize;
-            let mut best = self.forward_tentative_distance[x as usize];
-            for xy in from..to {
-                let y = self.cch.up_head[xy] as usize;
-                let dy = self.forward_tentative_distance[y];
+            let from = up_first_out[x as usize] as usize;
+            let to = up_first_out[x as usize + 1] as usize;
+            let mut best = dist[x as usize];
+            let heads = &up_head[from..to];
+            let weights = &backward[from..to];
+            for (&yv, &w) in heads.iter().zip(weights) {
+                let y = yv as usize;
+                // SAFETY: `y` is an `up_head` value — a valid CCH node id
+                // `< node_count == dist.len()` (validated in `ElimTreeQuery::new`).
+                let dy = unsafe { *dist.get_unchecked(y) };
                 if dy != INF_WEIGHT {
-                    let candidate = dy.saturating_add(metric.backward[xy]);
+                    let candidate = dy.saturating_add(w);
                     if candidate < best {
                         best = candidate;
                     }
                 }
             }
-            self.forward_tentative_distance[x as usize] = best;
+            dist[x as usize] = best;
         }
     }
 
@@ -280,6 +322,24 @@ pub fn distance_matrix(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `ElimTreeQuery::new` validates the invariant the hot-loop `get_unchecked`
+    /// relies on (every `up_head` value `< node_count`) and rejects a malformed
+    /// `CchView` rather than risking an out-of-bounds access.
+    #[test]
+    #[should_panic(expected = "up_head contains a node id")]
+    fn new_rejects_out_of_range_up_head() {
+        let view = CchView {
+            rank: &[0], // node_count = 1
+            elimination_tree_parent: &[INVALID_ID],
+            up_first_out: &[0, 1],
+            up_head: &[5], // 5 >= node_count (1) → invalid
+            down_first_out: &[0, 1],
+            down_head: &[0],
+            down_to_up: &[0],
+        };
+        let _ = ElimTreeQuery::new(&view);
+    }
 
     /// Differential correctness gate: compare our pure-Rust `distance_matrix`
     /// against the C++ oracle's `cch_compute_distance_matrix` for all pairs in

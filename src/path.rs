@@ -150,6 +150,15 @@ pub fn node_path(cch: &CchView, metric: &MetricView, source: u32, target: u32) -
 
     let n = cch.node_count() as usize;
 
+    // Hoist borrowed slices so the inner relaxation loops index plain `&[u32]`s
+    // and slice each node's arc range once — letting the compiler elide the
+    // per-arc bounds checks on `up_head` and the weight arrays.
+    let up_first_out = cch.up_first_out;
+    let up_head = cch.up_head;
+    let elim = cch.elimination_tree_parent;
+    let forward = metric.forward;
+    let backward = metric.backward;
+
     // order = inverse(rank): order[rank[v]] = v.
     let mut order = vec![0u32; n];
     for v in 0..n {
@@ -172,18 +181,20 @@ pub fn node_path(cch: &CchView, metric: &MetricView, source: u32, target: u32) -
             in_forward_search_space[x as usize] = true;
             let dx = fwd_dist[x as usize];
             if dx != INF_WEIGHT {
-                let from = cch.up_first_out[x as usize] as usize;
-                let to = cch.up_first_out[x as usize + 1] as usize;
-                for xy in from..to {
-                    let y = cch.up_head[xy] as usize;
-                    let cand = dx.saturating_add(metric.forward[xy]);
+                let from = up_first_out[x as usize] as usize;
+                let to = up_first_out[x as usize + 1] as usize;
+                let heads = &up_head[from..to];
+                let weights = &forward[from..to];
+                for (&yv, &w) in heads.iter().zip(weights) {
+                    let y = yv as usize;
+                    let cand = dx.saturating_add(w);
                     if cand < fwd_dist[y] {
                         fwd_dist[y] = cand;
                         fwd_pred[y] = x;
                     }
                 }
             }
-            let parent = cch.elimination_tree_parent[x as usize];
+            let parent = elim[x as usize];
             if parent == INVALID_ID {
                 break;
             }
@@ -207,11 +218,13 @@ pub fn node_path(cch: &CchView, metric: &MetricView, source: u32, target: u32) -
         loop {
             let dx = bwd_dist[x as usize];
             if dx != INF_WEIGHT {
-                let from = cch.up_first_out[x as usize] as usize;
-                let to = cch.up_first_out[x as usize + 1] as usize;
-                for xy in from..to {
-                    let y = cch.up_head[xy] as usize;
-                    let cand = dx.saturating_add(metric.backward[xy]);
+                let from = up_first_out[x as usize] as usize;
+                let to = up_first_out[x as usize + 1] as usize;
+                let heads = &up_head[from..to];
+                let weights = &backward[from..to];
+                for (&yv, &w) in heads.iter().zip(weights) {
+                    let y = yv as usize;
+                    let cand = dx.saturating_add(w);
                     if cand < bwd_dist[y] {
                         bwd_dist[y] = cand;
                         bwd_pred[y] = x;
