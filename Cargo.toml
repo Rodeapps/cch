@@ -8,7 +8,7 @@ repository = "https://github.com/Rodeapps/cch"
 homepage = "https://github.com/Rodeapps/cch"
 documentation = "https://docs.rs/cch"
 readme = "README.md"
-keywords = ["routing", "cch", "contraction-hierarchies", "shortest-path", "graph"]
+keywords = ["routing", "cch", "contraction", "shortest-path", "graph"]
 categories = ["algorithms", "science::geo"]
 rust-version = "1.85"
 
