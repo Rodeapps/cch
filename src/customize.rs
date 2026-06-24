@@ -35,6 +35,19 @@ pub struct Metric {
     pub backward: Vec<u32>,
 }
 
+impl Metric {
+    /// Borrow this in-memory metric as a [`MetricView`](crate::MetricView) — the
+    /// query-ready view consumed by [`distance_matrix`](crate::distance_matrix)
+    /// and [`node_path`](crate::node_path).
+    #[must_use]
+    pub fn view(&self) -> crate::bundle::MetricView<'_> {
+        crate::bundle::MetricView {
+            forward: &self.forward,
+            backward: &self.backward,
+        }
+    }
+}
+
 /// Saturating addition against [`INF_WEIGHT`].
 ///
 /// Matches the C++ exactly: it adds raw `unsigned`s, but since
@@ -149,6 +162,17 @@ impl Cch {
 mod tests {
     use super::*;
     use crate::graph::Graph;
+
+    #[test]
+    fn metric_view_borrows_fields() {
+        let m = Metric {
+            forward: vec![1, 2, 3],
+            backward: vec![4, 5, 6],
+        };
+        let v = m.view();
+        assert_eq!(v.forward, &[1, 2, 3]);
+        assert_eq!(v.backward, &[4, 5, 6]);
+    }
 
     /// Build a CSR `Graph` from grouped-by-tail arc lists.
     fn csr(node_count: usize, tail: &[u32], head: &[u32]) -> Graph {

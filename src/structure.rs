@@ -106,6 +106,23 @@ impl Cch {
         self.up_head.len()
     }
 
+    /// Borrow this in-memory CCH structure as a [`CchView`](crate::CchView) —
+    /// the query-ready view consumed by [`distance_matrix`](crate::distance_matrix)
+    /// and [`node_path`](crate::node_path). Lets you query a freshly-built `Cch`
+    /// without round-tripping through a `.cch-struct` bundle on disk.
+    #[must_use]
+    pub fn view(&self) -> crate::bundle::CchView<'_> {
+        crate::bundle::CchView {
+            rank: &self.rank,
+            elimination_tree_parent: &self.elimination_tree_parent,
+            up_first_out: &self.up_first_out,
+            up_head: &self.up_head,
+            down_first_out: &self.down_first_out,
+            down_head: &self.down_head,
+            down_to_up: &self.down_to_up,
+        }
+    }
+
     /// Builds the CCH structure from an input `graph` (CSR) and a contraction
     /// `order` (a permutation of node ids; `order[i]` is the i-th node to be
     /// contracted).
@@ -600,6 +617,31 @@ mod tests {
         assert_eq!(c.down_first_out, vec![0]);
         assert!(c.down_head.is_empty());
         assert!(c.down_to_up.is_empty());
+    }
+
+    // ------------------------------------------------------------------
+    // view() borrows the struct's arrays into a query-ready CchView.
+    // ------------------------------------------------------------------
+    #[test]
+    fn view_borrows_struct_fields() {
+        // 2-node graph with one arc so up/down arrays are non-empty.
+        let g = Graph {
+            first_out: vec![0, 1, 1],
+            head: vec![1],
+            weight: vec![5],
+        };
+        let c = Cch::build(&g, &[0u32, 1]);
+        let v = c.view();
+        assert_eq!(v.rank, c.rank.as_slice());
+        assert_eq!(
+            v.elimination_tree_parent,
+            c.elimination_tree_parent.as_slice()
+        );
+        assert_eq!(v.up_first_out, c.up_first_out.as_slice());
+        assert_eq!(v.up_head, c.up_head.as_slice());
+        assert_eq!(v.down_first_out, c.down_first_out.as_slice());
+        assert_eq!(v.down_head, c.down_head.as_slice());
+        assert_eq!(v.down_to_up, c.down_to_up.as_slice());
     }
 
     // ------------------------------------------------------------------
