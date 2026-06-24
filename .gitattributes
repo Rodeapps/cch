@@ -1,0 +1,5 @@
+# The vendored C++ RoutingKit oracle under oracle/ is a dev-only
+# differential-test dependency — not part of the published crate, not a
+# runtime dependency. Mark it vendored so GitHub Linguist excludes it from
+# the repository's language statistics and collapses it in diffs.
+oracle/** linguist-vendored
