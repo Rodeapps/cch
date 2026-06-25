@@ -125,6 +125,307 @@ fn unpack_arc(
 // Public API
 // ---------------------------------------------------------------------------
 
+/// Reusable, buffer-recycling node-path query against a single CCH.
+///
+/// [`node_path`] (the free fn) allocates ~6 `node_count`-sized scratch buffers
+/// and rebuilds the inverse-rank `order` array on **every** call. For repeated
+/// queries that per-call setup dominates. `PathQuery` pays that cost ONCE in
+/// [`PathQuery::new`] (allocate buffers, compute `order`, validate the CCH),
+/// then answers each [`PathQuery::path`] reusing the buffers with a cheap
+/// *touched-only* reset — restoring just the entries the previous query
+/// dirtied, never the whole `node_count`-sized arrays.
+///
+/// Results are byte-identical to [`node_path`] (same bidirectional
+/// elimination-tree search, same strict-`<` meeting tie-break, same shortcut
+/// unpacking).
+///
+/// ```
+/// # use cch::graph::Graph;
+/// # use cch::{Cch, degree_order, PathQuery, node_path};
+/// let graph = Graph { first_out: vec![0, 1, 2, 3, 3], head: vec![1, 2, 3], weight: vec![1, 1, 1] };
+/// let order = degree_order(&graph);
+/// let cch = Cch::build(&graph, &order);
+/// let metric = cch.customize(&graph.weight);
+/// let cv = cch.view();
+/// let mv = metric.view();
+/// let mut q = PathQuery::new(&cv);
+/// // Each `.path` reuses the buffers and matches the one-shot `node_path`.
+/// assert_eq!(q.path(&mv, 0, 3), node_path(&cv, &mv, 0, 3));
+/// assert_eq!(q.path(&mv, 1, 3), node_path(&cv, &mv, 1, 3));
+/// ```
+pub struct PathQuery<'a> {
+    cch: &'a CchView<'a>,
+    /// Inverse rank: `order[rank[v]] = v`. Computed once in [`Self::new`] and
+    /// never mutated thereafter (invariant; not part of the touched reset).
+    order: Vec<u32>,
+    /// Forward sweep tentative distances; `node_count`-sized, all [`INF_WEIGHT`]
+    /// between queries.
+    fwd_dist: Vec<u32>,
+    /// Forward sweep predecessors; `node_count`-sized, all [`INVALID_ID`]
+    /// between queries.
+    fwd_pred: Vec<u32>,
+    /// Forward search-space membership; `node_count`-sized, all `false` between
+    /// queries.
+    in_forward_search_space: Vec<bool>,
+    /// Backward sweep tentative distances; `node_count`-sized, all
+    /// [`INF_WEIGHT`] between queries.
+    bwd_dist: Vec<u32>,
+    /// Backward sweep predecessors; `node_count`-sized, all [`INVALID_ID`]
+    /// between queries.
+    bwd_pred: Vec<u32>,
+    /// Nodes whose `fwd_*` entries were dirtied by the last query — exactly the
+    /// set the next reset must restore. Cleared each query.
+    fwd_touched: Vec<u32>,
+    /// Nodes whose `bwd_*` entries were dirtied by the last query.
+    bwd_touched: Vec<u32>,
+    /// Reconstruction scratch holding the forward elim-path `[meeting, .., s]`.
+    /// Reused across queries; capacity grows monotonically.
+    up_path: Vec<u32>,
+}
+
+impl<'a> PathQuery<'a> {
+    /// Allocate scratch buffers and compute the inverse-rank `order` for queries
+    /// against `cch`. Do this once, then call [`Self::path`] repeatedly.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `cch` is malformed — specifically if any `up_head` value is not
+    /// a valid node id (`>= node_count`). A `CchView` from
+    /// [`Cch::build`](crate::Cch::build) or a [`CchBundle`](crate::CchBundle)
+    /// always satisfies this. This single validation lets [`Self::path`]'s hot
+    /// relaxation loops index the distance/pred arrays with `get_unchecked`
+    /// soundly (mirrors [`ElimTreeQuery::new`](crate::ElimTreeQuery)).
+    #[must_use]
+    #[allow(clippy::cast_possible_truncation)] // v < node_count ≤ u32::MAX by CCH invariant
+    pub fn new(cch: &'a CchView<'a>) -> Self {
+        let n = cch.node_count() as usize;
+        // The hot relaxation loops in `path` use `get_unchecked`/`_mut` to access
+        // `fwd_dist[y]`/`fwd_pred[y]`/`bwd_dist[y]`/`bwd_pred[y]` where `y` is an
+        // `up_head` value. Those arrays are sized to `node_count` below, so the
+        // accesses are sound iff every up-arc head is `< node_count`. A
+        // well-formed CCH guarantees this; validate it once here (O(arc_count),
+        // amortized to ~0 over many queries) so the unchecked accesses are sound
+        // for any `CchView`, however it was constructed.
+        assert!(
+            cch.up_head.iter().all(|&h| (h as usize) < n),
+            "malformed CchView: up_head contains a node id >= node_count"
+        );
+
+        // order = inverse(rank): order[rank[v]] = v. Computed once.
+        let mut order = vec![0u32; n];
+        for v in 0..n {
+            order[cch.rank[v] as usize] = v as u32; // v < node_count ≤ u32::MAX
+        }
+
+        Self {
+            cch,
+            order,
+            fwd_dist: vec![INF_WEIGHT; n],
+            fwd_pred: vec![INVALID_ID; n],
+            in_forward_search_space: vec![false; n],
+            bwd_dist: vec![INF_WEIGHT; n],
+            bwd_pred: vec![INVALID_ID; n],
+            fwd_touched: Vec::new(),
+            bwd_touched: Vec::new(),
+            up_path: Vec::new(),
+        }
+    }
+
+    /// Shortest-path node sequence in ORIGINAL dense node ids, source first,
+    /// target last, reusing this query's buffers. Returns `None` if `target` is
+    /// unreachable from `source`; self-pair (`source == target`) returns
+    /// `Some(vec![source])`. Identical to [`node_path`].
+    ///
+    /// # Panics
+    ///
+    /// Panics via `expect` if the CCH structure is inconsistent (an arc recorded
+    /// in `fwd_pred`/`bwd_pred` is not found in the up-arc list). This never
+    /// happens with a valid, routingkit-produced CCH bundle.
+    #[must_use]
+    #[allow(clippy::too_many_lines)] // faithful port of routingkit's path query — splitting obscures algorithm
+    #[allow(clippy::many_single_char_names)] // s,t,x,y,l: conventional rank-space node variables
+    pub fn path(&mut self, metric: &MetricView, source: u32, target: u32) -> Option<Vec<u32>> {
+        if source == target {
+            return Some(vec![source]);
+        }
+
+        // Cheap touched-only reset: restore exactly the entries the previous
+        // query dirtied (NOT the whole node_count-sized arrays). `order` is
+        // invariant and never reset.
+        for &nd in &self.fwd_touched {
+            let i = nd as usize;
+            self.fwd_dist[i] = INF_WEIGHT;
+            self.fwd_pred[i] = INVALID_ID;
+            self.in_forward_search_space[i] = false;
+        }
+        self.fwd_touched.clear();
+        for &nd in &self.bwd_touched {
+            let i = nd as usize;
+            self.bwd_dist[i] = INF_WEIGHT;
+            self.bwd_pred[i] = INVALID_ID;
+        }
+        self.bwd_touched.clear();
+
+        let cch = self.cch;
+        // Hoist borrowed slices so the inner relaxation loops index plain
+        // `&[u32]`s and slice each node's arc range once — letting the compiler
+        // elide the per-arc bounds checks on `up_head` and the weight arrays.
+        let up_first_out = cch.up_first_out;
+        let up_head = cch.up_head;
+        let elim = cch.elimination_tree_parent;
+        let forward = metric.forward;
+        let backward = metric.backward;
+
+        let s = cch.rank[source as usize];
+        let t = cch.rank[target as usize];
+
+        // Forward sweep from s (up-arcs, forward weights). Relax along the
+        // elimination-tree ancestor chain of s, recording predecessors and
+        // marking the forward search space. Mirrors routingkit's `run()`.
+        self.fwd_dist[s as usize] = 0;
+        self.fwd_touched.push(s);
+        {
+            let fwd_dist = &mut self.fwd_dist;
+            let fwd_pred = &mut self.fwd_pred;
+            let touched = &mut self.fwd_touched;
+            let mut x = s;
+            loop {
+                self.in_forward_search_space[x as usize] = true;
+                let dx = fwd_dist[x as usize];
+                if dx != INF_WEIGHT {
+                    let from = up_first_out[x as usize] as usize;
+                    let to = up_first_out[x as usize + 1] as usize;
+                    let heads = &up_head[from..to];
+                    let weights = &forward[from..to];
+                    for (&yv, &w) in heads.iter().zip(weights) {
+                        let y = yv as usize;
+                        let cand = dx.saturating_add(w);
+                        // SAFETY: `y` is an `up_head` value — a valid CCH node id
+                        // `< node_count == fwd_dist.len() == fwd_pred.len()`,
+                        // established once by the structural validation in
+                        // `PathQuery::new`.
+                        let slot = unsafe { fwd_dist.get_unchecked_mut(y) };
+                        if cand < *slot {
+                            *slot = cand;
+                            // SAFETY: same as above — `y < node_count`.
+                            unsafe { *fwd_pred.get_unchecked_mut(y) = x };
+                            touched.push(yv);
+                        }
+                    }
+                }
+                let parent = elim[x as usize];
+                if parent == INVALID_ID {
+                    break;
+                }
+                x = parent;
+                touched.push(x);
+            }
+        }
+
+        // Backward sweep from t (up-arcs, backward weights), choosing the meeting
+        // node EXACTLY as routingkit does: walk t's ancestor chain in order,
+        // relaxing then — if x is in the forward search space — updating the
+        // meeting node with a STRICT `<` test. This reproduces routingkit's
+        // tie-break (first equal-cost ancestor wins) so node paths are
+        // byte-identical to `get_node_path`.
+        self.bwd_dist[t as usize] = 0;
+        self.bwd_touched.push(t);
+        let mut meeting = INVALID_ID;
+        let mut best = INF_WEIGHT;
+        {
+            let bwd_dist = &mut self.bwd_dist;
+            let bwd_pred = &mut self.bwd_pred;
+            let touched = &mut self.bwd_touched;
+            let mut x = t;
+            loop {
+                let dx = bwd_dist[x as usize];
+                if dx != INF_WEIGHT {
+                    let from = up_first_out[x as usize] as usize;
+                    let to = up_first_out[x as usize + 1] as usize;
+                    let heads = &up_head[from..to];
+                    let weights = &backward[from..to];
+                    for (&yv, &w) in heads.iter().zip(weights) {
+                        let y = yv as usize;
+                        let cand = dx.saturating_add(w);
+                        // SAFETY: `y` is an `up_head` value — a valid CCH node id
+                        // `< node_count == bwd_dist.len() == bwd_pred.len()`,
+                        // established once by the structural validation in
+                        // `PathQuery::new`.
+                        let slot = unsafe { bwd_dist.get_unchecked_mut(y) };
+                        if cand < *slot {
+                            *slot = cand;
+                            // SAFETY: same as above — `y < node_count`.
+                            unsafe { *bwd_pred.get_unchecked_mut(y) = x };
+                            touched.push(yv);
+                        }
+                    }
+                }
+                if self.in_forward_search_space[x as usize] {
+                    let fd = self.fwd_dist[x as usize];
+                    let bd = bwd_dist[x as usize];
+                    if fd != INF_WEIGHT && bd != INF_WEIGHT {
+                        let l = fd.saturating_add(bd);
+                        if l < best {
+                            best = l;
+                            meeting = x;
+                        }
+                    }
+                }
+                let parent = elim[x as usize];
+                if parent == INVALID_ID {
+                    break;
+                }
+                x = parent;
+                touched.push(x);
+            }
+        }
+
+        if meeting == INVALID_ID || best == INF_WEIGHT {
+            return None;
+        }
+
+        let mut out: Vec<u32> = Vec::new();
+        let order = &self.order;
+
+        // Forward half: chain source → meeting via fwd_pred (rank space).
+        // up_path = [meeting, pred(meeting), ..., s]; unpack from top down so we
+        // emit interior heads in source→target order.
+        self.up_path.clear();
+        self.up_path.push(meeting);
+        {
+            let mut x = meeting;
+            while self.fwd_pred[x as usize] != INVALID_ID {
+                x = self.fwd_pred[x as usize];
+                self.up_path.push(x);
+            }
+        }
+        // up_path is [meeting, ..., s]; iterate i from high (near s) down to 1.
+        for i in (1..self.up_path.len()).rev() {
+            let tail = self.up_path[i]; // closer to s
+            let head = self.up_path[i - 1]; // closer to meeting
+            let arc = find_up_arc(cch, tail, head).expect("forward up-arc on elim path");
+            unpack_arc(cch, metric, order, &Dir::Fwd, tail, head, arc, &mut out);
+        }
+
+        // Backward half: meeting → target via bwd_pred. Each step y = pred(x) is
+        // an up-arc y→x in rank space; unpack it backward (emits head = order[x]).
+        {
+            let mut x = meeting;
+            let mut y = self.bwd_pred[x as usize];
+            while y != INVALID_ID {
+                let arc = find_up_arc(cch, y, x).expect("backward up-arc on elim path");
+                unpack_arc(cch, metric, order, &Dir::Bwd, y, x, arc, &mut out);
+                x = y;
+                y = self.bwd_pred[y as usize];
+            }
+            // x is now the last node on the backward chain (== t in rank space).
+            out.push(order[x as usize]);
+        }
+
+        Some(out)
+    }
+}
+
 /// Shortest-path node sequence in ORIGINAL dense node ids, source first,
 /// target last. Returns `None` if `target` is unreachable from `source`.
 /// Self-pair (`source == target`) returns `Some(vec![source])`.
@@ -133,6 +434,14 @@ fn unpack_arc(
 /// elimination-tree search recording predecessors, followed by recursive
 /// shortcut unpacking. Produces results byte-identical to the C++
 /// `get_node_path` (verified by `mmap_unpack_matches_cpp_reference_over_200_pairs`).
+///
+/// This is a one-shot query: it allocates its scratch buffers and rebuilds the
+/// inverse-rank `order` per call. For repeated queries against the same CCH use
+/// [`PathQuery`], which amortizes both away across calls — clearly faster than
+/// the C++ oracle for repeated path queries. `node_path` is kept standalone
+/// (rather than delegating to `PathQuery::new(..).path(..)`) because the
+/// one-time `O(arc_count)` `up_head` validation in [`PathQuery::new`] would
+/// regress this one-shot path meaningfully below C++ parity; see the benches.
 ///
 /// # Panics
 ///
@@ -765,5 +1074,245 @@ mod tests {
         // All arcs have INF_WEIGHT → no relaxation from source → ancestors at INF.
         let result = node_path(&cv, &mv, 0, 4);
         assert!(result.is_none(), "all-INF metric means 0→4 is unreachable");
+    }
+
+    // -----------------------------------------------------------------------
+    // PathQuery (buffer-reusing) tests
+    // -----------------------------------------------------------------------
+
+    /// `PathQuery::new` validates the invariant the hot-loop `get_unchecked`
+    /// relies on (every `up_head` value `< node_count`) and rejects a malformed
+    /// `CchView`, mirroring `query.rs::new_rejects_out_of_range_up_head`.
+    #[test]
+    #[should_panic(expected = "up_head contains a node id")]
+    fn pathquery_new_rejects_out_of_range_up_head() {
+        let view = CchView {
+            rank: &[0], // node_count = 1
+            elimination_tree_parent: &[INVALID_ID],
+            up_first_out: &[0, 1],
+            up_head: &[5], // 5 >= node_count (1) → invalid
+            down_first_out: &[0, 1],
+            down_head: &[0],
+            down_to_up: &[0],
+        };
+        let _ = PathQuery::new(&view);
+    }
+
+    /// Self-pair on a reused `PathQuery` returns `Some(vec![s])` (and exercises
+    /// the early-return branch before any reset).
+    #[test]
+    fn pathquery_self_pair_is_single_node() {
+        use crate::bundle::{CchBundle, MetricBundle};
+
+        let (sp, mp) = test_bundle_paths();
+        let cch_bundle = CchBundle::open(&sp).unwrap();
+        let metric_bundle = MetricBundle::open(&mp).unwrap();
+        let (cv, mv) = (cch_bundle.view(), metric_bundle.view());
+        let mut q = PathQuery::new(&cv);
+        assert_eq!(q.path(&mv, 0, 0).unwrap(), vec![0]);
+        // A self-pair must not corrupt a subsequent real query.
+        assert_eq!(q.path(&mv, 0, 5), node_path(&cv, &mv, 0, 5));
+    }
+
+    /// Unreachable pair on a reused `PathQuery` returns `None`, and a reachable
+    /// query issued afterwards still matches the one-shot `node_path` (proves
+    /// the touched reset survives a `None`-returning query).
+    #[test]
+    fn pathquery_unreachable_returns_none() {
+        use crate::bundle::{CchBundle, MetricBundle};
+        use routingkit_cch::ffi;
+
+        let tail = vec![0u32];
+        let head = vec![1u32];
+        let weights = vec![7u32];
+        let order = vec![0u32, 1];
+        let cch = unsafe { ffi::cch_new(&order, &tail, &head, |_| {}, false) };
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let sp = tmp.path().join("pqu.cch-struct");
+        let mp = tmp.path().join("pqu.cch-metric");
+        unsafe {
+            ffi::cch_save_struct(cch.as_ref().unwrap(), sp.to_str().unwrap()).unwrap();
+            let mut metric = ffi::cch_metric_new(cch.as_ref().unwrap(), &weights);
+            ffi::cch_metric_customize(metric.as_mut().unwrap());
+            ffi::cch_save_metric(metric.as_ref().unwrap(), mp.to_str().unwrap()).unwrap();
+        }
+        let _ = tmp.keep();
+        let cch_bundle = CchBundle::open(&sp).unwrap();
+        let metric_bundle = MetricBundle::open(&mp).unwrap();
+        let (cv, mv) = (cch_bundle.view(), metric_bundle.view());
+        let mut q = PathQuery::new(&cv);
+        assert!(q.path(&mv, 1, 0).is_none(), "1→0 unreachable");
+        // Reachable pair after the None query must still be correct.
+        assert_eq!(q.path(&mv, 0, 1), node_path(&cv, &mv, 0, 1));
+    }
+
+    /// REUSE correctness — the key gate. Run the 200-pair deterministic-LCG
+    /// differential through a SINGLE reused `PathQuery` (one `new`, then 200
+    /// `.path()` calls), asserting each result equals the C++ oracle. This
+    /// proves the touched reset restores state correctly across queries.
+    #[test]
+    #[allow(clippy::cast_possible_truncation)] // up_first_out.len()-1 == node_count ≤ u32::MAX
+    fn pathquery_reuse_matches_cpp_over_200_pairs() {
+        use crate::bundle::{CchBundle, MetricBundle};
+        use routingkit_cch::ffi;
+
+        let mut tail = Vec::new();
+        let mut head = Vec::new();
+        for i in 0u32..9 {
+            tail.push(i);
+            head.push(i + 1);
+        }
+        tail.push(9);
+        head.push(0);
+        tail.push(0);
+        head.push(5);
+        let weights: Vec<u32> = vec![1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 100];
+        let order: Vec<u32> = (0u32..10).collect();
+        let cch = unsafe { ffi::cch_new(&order, &tail, &head, |_| {}, false) };
+
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let sp = tmp.path().join("pq200.cch-struct");
+        let mp = tmp.path().join("pq200.cch-metric");
+        let metric_uptr;
+        unsafe {
+            ffi::cch_save_struct(cch.as_ref().unwrap(), sp.to_str().unwrap()).unwrap();
+            let mut metric = ffi::cch_metric_new(cch.as_ref().unwrap(), &weights);
+            ffi::cch_metric_customize(metric.as_mut().unwrap());
+            ffi::cch_save_metric(metric.as_ref().unwrap(), mp.to_str().unwrap()).unwrap();
+            metric_uptr = metric;
+        }
+        let _ = tmp.keep();
+
+        let cch_bundle = CchBundle::open(&sp).unwrap();
+        let metric_bundle = MetricBundle::open(&mp).unwrap();
+        let (cv, mv) = (cch_bundle.view(), metric_bundle.view());
+        let n = cv.up_first_out.len() as u32 - 1;
+
+        // ONE PathQuery, reused for all 200 pairs — this is the reuse gate.
+        let mut q = PathQuery::new(&cv);
+
+        let mut seed: u64 = 0x9E37_79B9_7F4A_7C15;
+        for _ in 0..200 {
+            seed = seed
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            let s = ((seed >> 33) as u32) % n;
+            seed = seed
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            let t = ((seed >> 33) as u32) % n;
+
+            let mut cq = unsafe { ffi::cch_query_new(metric_uptr.as_ref().unwrap()) };
+            unsafe {
+                ffi::cch_query_add_source(cq.as_mut().unwrap(), s, 0);
+                ffi::cch_query_add_target(cq.as_mut().unwrap(), t, 0);
+                ffi::cch_query_run(cq.as_mut().unwrap());
+            }
+            let cpp_vec: Vec<u32> = unsafe { ffi::cch_query_node_path(cq.as_ref().unwrap()) };
+            let theirs: Option<Vec<u32>> = (!cpp_vec.is_empty()).then_some(cpp_vec);
+
+            let ours = q.path(&mv, s, t);
+            assert_eq!(
+                ours, theirs,
+                "reused PathQuery path mismatch for ({s} -> {t})"
+            );
+        }
+    }
+
+    /// Stale-state hunter: issue the SAME pair twice and DIFFERENT pairs
+    /// interleaved on one `PathQuery`, asserting each `.path()` matches a fresh
+    /// one-shot `node_path`. Catches buffer-reset bugs the sequential 200-pair
+    /// run could mask.
+    #[test]
+    fn pathquery_repeated_and_interleaved_pairs_match_node_path() {
+        use crate::bundle::{CchBundle, MetricBundle};
+
+        let (sp, mp) = test_bundle_paths();
+        let cch_bundle = CchBundle::open(&sp).unwrap();
+        let metric_bundle = MetricBundle::open(&mp).unwrap();
+        let (cv, mv) = (cch_bundle.view(), metric_bundle.view());
+
+        let mut q = PathQuery::new(&cv);
+        // Interleave: same pair twice, then alternate distinct pairs, then
+        // revisit an earlier pair — every result must match a fresh node_path.
+        let probes = [
+            (0u32, 5u32),
+            (0, 5), // same pair again — reset must be idempotent
+            (5, 0),
+            (3, 8),
+            (0, 5), // revisit
+            (8, 3),
+            (7, 2),
+            (3, 8), // revisit
+            (1, 1), // self-pair in the middle
+            (2, 9),
+            (5, 0), // revisit
+        ];
+        for &(s, t) in &probes {
+            assert_eq!(
+                q.path(&mv, s, t),
+                node_path(&cv, &mv, s, t),
+                "reused PathQuery disagrees with one-shot node_path for ({s} -> {t})"
+            );
+        }
+    }
+
+    /// Parity over assorted pairs: `PathQuery::path` == `node_path` (free fn).
+    /// All reachable pairs of the 10-node fixture through one reused query.
+    #[test]
+    fn pathquery_all_pairs_match_node_path() {
+        use crate::bundle::{CchBundle, MetricBundle};
+
+        let (sp, mp) = test_bundle_paths();
+        let cch_bundle = CchBundle::open(&sp).unwrap();
+        let metric_bundle = MetricBundle::open(&mp).unwrap();
+        let (cv, mv) = (cch_bundle.view(), metric_bundle.view());
+
+        let mut q = PathQuery::new(&cv);
+        for s in 0..10u32 {
+            for t in 0..10u32 {
+                assert_eq!(
+                    q.path(&mv, s, t),
+                    node_path(&cv, &mv, s, t),
+                    "mismatch for ({s} -> {t})"
+                );
+            }
+        }
+    }
+
+    /// Cover the forward-sweep `if dx != INF_WEIGHT` false branch on a reused
+    /// `PathQuery` (all-INF metric → ancestors stay at INF), matching the
+    /// `node_path` coverage test.
+    #[test]
+    fn pathquery_fwd_sweep_inf_weight_branch() {
+        use crate::bundle::{CchBundle, MetricBundle};
+        use routingkit_cch::ffi;
+
+        let n: u32 = 5;
+        let order: Vec<u32> = (0..n).collect();
+        let tail: Vec<u32> = (0..n - 1).collect();
+        let head: Vec<u32> = (1..n).collect();
+        let weights: Vec<u32> = vec![crate::INF_WEIGHT; tail.len()];
+
+        let cch = unsafe { ffi::cch_new(&order, &tail, &head, |_| {}, false) };
+        let cch_ref = cch.as_ref().expect("cch_new returned null");
+        let dir = tempfile::tempdir().expect("tempdir");
+        let sp = dir.path().join("pqfwdinf.cch-struct");
+        let mp = dir.path().join("pqfwdinf.cch-metric");
+        let mut metric = unsafe { ffi::cch_metric_new(cch_ref, &weights) };
+        unsafe {
+            ffi::cch_save_struct(cch_ref, sp.to_str().unwrap()).unwrap();
+            ffi::cch_metric_customize(metric.as_mut().unwrap());
+            ffi::cch_save_metric(metric.as_ref().unwrap(), mp.to_str().unwrap()).unwrap();
+        }
+        let cch_bundle = CchBundle::open(&sp).unwrap();
+        let metric_bundle = MetricBundle::open(&mp).unwrap();
+        let (cv, mv) = (cch_bundle.view(), metric_bundle.view());
+
+        let mut q = PathQuery::new(&cv);
+        assert!(
+            q.path(&mv, 0, 4).is_none(),
+            "all-INF metric → 0→4 unreachable"
+        );
     }
 }
