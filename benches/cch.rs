@@ -328,6 +328,175 @@ fn bench_node_path(c: &mut Criterion) {
 }
 
 // ---------------------------------------------------------------------------
+// Bench: path_query  (reused PathQuery vs amortized C++, same 200 LCG pairs)
+// ---------------------------------------------------------------------------
+
+fn bench_path_query(c: &mut Criterion) {
+    let (n, tail, head, weights) = make_grid(24, 24);
+    let graph = csr_from_arcs(n, &tail, &head);
+    let order = cch::degree_order(&graph);
+
+    // Rust: build + customize + mmap bundles.
+    let rust_cch = cch::Cch::build(&graph, &order);
+    let rust_met = rust_cch.customize(&weights);
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let struct_path = tmp.path().join("bench_pq.cch-struct");
+    let metric_path = tmp.path().join("bench_pq.cch-metric");
+    rust_cch.save_struct(&struct_path).expect("save_struct");
+    rust_met.save(&metric_path).expect("save metric");
+    let rust_bundle = cch::bundle::CchBundle::open(&struct_path).expect("CchBundle::open");
+    let rust_met_bundle =
+        cch::bundle::MetricBundle::open(&metric_path).expect("MetricBundle::open");
+    let cv = rust_bundle.view();
+    let mv = rust_met_bundle.view();
+
+    // C++: build + customize.
+    let cpp_cch = unsafe { ffi::cch_new(&order, &tail, &head, |_| {}, false) };
+    let cpp_cch_ref = cpp_cch.as_ref().expect("cch_new returned null");
+    let mut cpp_metric = unsafe { ffi::cch_metric_new(cpp_cch_ref, &weights) };
+    unsafe { ffi::cch_metric_customize(cpp_metric.as_mut().expect("metric pin")) };
+    let cpp_met_ref = cpp_metric.as_ref().expect("metric ref");
+
+    // Same 200 deterministic LCG pairs as the e2e test / node_path bench.
+    let mut pairs: Vec<(u32, u32)> = Vec::with_capacity(200);
+    let mut seed: u64 = 0x9E37_79B9_7F4A_7C15;
+    for _ in 0..200 {
+        seed = seed
+            .wrapping_mul(6_364_136_223_846_793_005)
+            .wrapping_add(1_442_695_040_888_963_407);
+        let src = ((seed >> 33) as u32) % n;
+        seed = seed
+            .wrapping_mul(6_364_136_223_846_793_005)
+            .wrapping_add(1_442_695_040_888_963_407);
+        let tgt = ((seed >> 33) as u32) % n;
+        pairs.push((src, tgt));
+    }
+
+    let mut g: BenchmarkGroup<WallTime> = c.benchmark_group("path_query/24x24_200pairs");
+    g.sample_size(20);
+
+    // Rust: ONE reused PathQuery (buffers + order allocated once outside the
+    // timed loop), answering all 200 pairs per iteration.
+    let mut pq = cch::PathQuery::new(&cv);
+    g.bench_function(BenchmarkId::new("rust", ""), |b| {
+        b.iter(|| {
+            for &(src, tgt) in &pairs {
+                black_box(pq.path(black_box(&mv), black_box(src), black_box(tgt)));
+            }
+        });
+    });
+
+    // C++: one CCHQuery reset+reused per pair (amortized, identical to the
+    // node_path/cpp bench).
+    let mut cpp_query = unsafe { ffi::cch_query_new(cpp_met_ref) };
+    g.bench_function(BenchmarkId::new("cpp", ""), |b| {
+        b.iter(|| {
+            for &(src, tgt) in &pairs {
+                unsafe {
+                    ffi::cch_query_reset(cpp_query.as_mut().unwrap(), cpp_met_ref);
+                    ffi::cch_query_add_source(cpp_query.as_mut().unwrap(), src, 0);
+                    ffi::cch_query_add_target(cpp_query.as_mut().unwrap(), tgt, 0);
+                    ffi::cch_query_run(cpp_query.as_mut().unwrap());
+                    black_box(ffi::cch_query_node_path(cpp_query.as_ref().unwrap()));
+                }
+            }
+        });
+    });
+
+    g.finish();
+}
+
+// ---------------------------------------------------------------------------
+// Bench: path queries on a LARGER grid (64x64 ≈ 4096 nodes), where the
+// per-call buffer allocation + O(n) `order` rebuild of the one-shot `node_path`
+// is no longer negligible — so the reuse advantage of `PathQuery` shows.
+// Compares one-shot node_path vs reused PathQuery vs amortized C++.
+// ---------------------------------------------------------------------------
+
+fn bench_path_query_large(c: &mut Criterion) {
+    let (n, tail, head, weights) = make_grid(64, 64);
+    let graph = csr_from_arcs(n, &tail, &head);
+    let order = cch::degree_order(&graph);
+
+    let rust_cch = cch::Cch::build(&graph, &order);
+    let rust_met = rust_cch.customize(&weights);
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let struct_path = tmp.path().join("bench_pql.cch-struct");
+    let metric_path = tmp.path().join("bench_pql.cch-metric");
+    rust_cch.save_struct(&struct_path).expect("save_struct");
+    rust_met.save(&metric_path).expect("save metric");
+    let rust_bundle = cch::bundle::CchBundle::open(&struct_path).expect("CchBundle::open");
+    let rust_met_bundle =
+        cch::bundle::MetricBundle::open(&metric_path).expect("MetricBundle::open");
+    let cv = rust_bundle.view();
+    let mv = rust_met_bundle.view();
+
+    let cpp_cch = unsafe { ffi::cch_new(&order, &tail, &head, |_| {}, false) };
+    let cpp_cch_ref = cpp_cch.as_ref().expect("cch_new returned null");
+    let mut cpp_metric = unsafe { ffi::cch_metric_new(cpp_cch_ref, &weights) };
+    unsafe { ffi::cch_metric_customize(cpp_metric.as_mut().expect("metric pin")) };
+    let cpp_met_ref = cpp_metric.as_ref().expect("metric ref");
+
+    let mut pairs: Vec<(u32, u32)> = Vec::with_capacity(200);
+    let mut seed: u64 = 0x9E37_79B9_7F4A_7C15;
+    for _ in 0..200 {
+        seed = seed
+            .wrapping_mul(6_364_136_223_846_793_005)
+            .wrapping_add(1_442_695_040_888_963_407);
+        let src = ((seed >> 33) as u32) % n;
+        seed = seed
+            .wrapping_mul(6_364_136_223_846_793_005)
+            .wrapping_add(1_442_695_040_888_963_407);
+        let tgt = ((seed >> 33) as u32) % n;
+        pairs.push((src, tgt));
+    }
+
+    let mut g: BenchmarkGroup<WallTime> = c.benchmark_group("path_query/64x64_200pairs");
+    g.sample_size(20);
+
+    // One-shot: allocates ~6 n-sized buffers + rebuilds `order` per call.
+    g.bench_function(BenchmarkId::new("node_path_oneshot", ""), |b| {
+        b.iter(|| {
+            for &(src, tgt) in &pairs {
+                black_box(cch::node_path(
+                    black_box(&cv),
+                    black_box(&mv),
+                    black_box(src),
+                    black_box(tgt),
+                ));
+            }
+        });
+    });
+
+    // Reused: buffers + `order` allocated once.
+    let mut pq = cch::PathQuery::new(&cv);
+    g.bench_function(BenchmarkId::new("path_query_reused", ""), |b| {
+        b.iter(|| {
+            for &(src, tgt) in &pairs {
+                black_box(pq.path(black_box(&mv), black_box(src), black_box(tgt)));
+            }
+        });
+    });
+
+    let mut cpp_query = unsafe { ffi::cch_query_new(cpp_met_ref) };
+    g.bench_function(BenchmarkId::new("cpp", ""), |b| {
+        b.iter(|| {
+            for &(src, tgt) in &pairs {
+                unsafe {
+                    ffi::cch_query_reset(cpp_query.as_mut().unwrap(), cpp_met_ref);
+                    ffi::cch_query_add_source(cpp_query.as_mut().unwrap(), src, 0);
+                    ffi::cch_query_add_target(cpp_query.as_mut().unwrap(), tgt, 0);
+                    ffi::cch_query_run(cpp_query.as_mut().unwrap());
+                    black_box(ffi::cch_query_node_path(cpp_query.as_ref().unwrap()));
+                }
+            }
+        });
+    });
+
+    g.finish();
+}
+
+// ---------------------------------------------------------------------------
 // Criterion harness
 // ---------------------------------------------------------------------------
 
@@ -338,5 +507,7 @@ criterion_group!(
     bench_customize,
     bench_distance_matrix,
     bench_node_path,
+    bench_path_query,
+    bench_path_query_large,
 );
 criterion_main!(benches);

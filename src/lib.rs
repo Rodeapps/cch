@@ -76,6 +76,6 @@ mod writer;
 pub use bundle::{CchBundle, CchView, MetricBundle, MetricView};
 pub use customize::Metric;
 pub use order::{degree_order, inertial_order};
-pub use path::node_path;
+pub use path::{PathQuery, node_path};
 pub use query::{ElimTreeQuery, distance_matrix};
 pub use structure::Cch;
