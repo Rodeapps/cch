@@ -53,11 +53,13 @@ impl Metric {
 /// (metric-independent) and reused across customizations. `nodes` lists every
 /// node id level-major (level 0 first); `first[l]..first[l+1]` slices `nodes`
 /// for level `l`.
-// `Levels`/`compute_levels` are wired into `Cch::customize` by a following
-// task; kept unused-but-tested here so this step stays reviewable on its own.
-#[allow(dead_code)]
 pub(crate) struct Levels {
+    // Consumed by the parallel relaxation added in a later task; `Customizer`
+    // already computes and stores a `Levels` (see `Cch::customizer`), but
+    // nothing walks `nodes`/`first` yet outside tests.
+    #[allow(dead_code)]
     pub nodes: Vec<u32>,
+    #[allow(dead_code)]
     pub first: Vec<u32>,
 }
 
@@ -67,7 +69,6 @@ pub(crate) struct Levels {
 /// `1 + max(height[child])`. Because `elimination_tree_parent[x]` always has a
 /// strictly higher rank than `x`, iterating `x` in increasing rank finalizes
 /// `height[x]` before it is read as a child (all children have lower rank).
-#[allow(dead_code)]
 pub(crate) fn compute_levels(cch: &Cch) -> Levels {
     let n = cch.node_count();
     let mut height = vec![0u32; n];
@@ -131,86 +132,133 @@ fn min_to(x: &mut u32, y: u32) {
 }
 
 impl Cch {
+    /// Build a reusable [`Customizer`] for this structure. Derives the
+    /// elimination-tree level partition once; reuse the returned `Customizer`
+    /// across many metrics to avoid recomputing it and to reuse output buffers
+    /// via [`Customizer::customize_into`].
+    #[must_use]
+    pub fn customizer(&self) -> Customizer<'_> {
+        Customizer {
+            cch: self,
+            levels: compute_levels(self),
+        }
+    }
+
     /// Customizes this CCH with per-INPUT-arc `weights`, producing the forward
     /// and backward shortcut weights of every CCH arc.
     ///
-    /// Bit-identical to `RoutingKit`'s single-threaded
-    /// `CustomizableContractionHierarchyMetric::customize()`.
+    /// Bit-identical to `RoutingKit`'s `customize()`. For repeated customization
+    /// of the same structure, prefer [`Cch::customizer`] +
+    /// [`Customizer::customize_into`] to avoid re-allocating output buffers.
     ///
     /// # Panics
-    /// Panics if `weights.len()` does not equal the number of input arcs (i.e.
-    /// `self.input_arc_to_cch_arc.len()`).
+    /// Panics if `weights.len()` != the number of input arcs
+    /// (`self.input_arc_to_cch_arc.len()`).
     #[must_use]
     pub fn customize(&self, weights: &[u32]) -> Metric {
+        self.customizer().customize(weights)
+    }
+}
+
+/// Reusable customizer for one [`Cch`]. Owns the metric-independent
+/// elimination-tree level partition so repeated customizations do not recompute
+/// it, and lets callers reuse output buffers via [`Self::customize_into`].
+pub struct Customizer<'a> {
+    cch: &'a Cch,
+    // Consumed by the parallel relaxation added in a later task; retained now
+    // so callers don't recompute it across repeated `customize_into` calls.
+    #[allow(dead_code)]
+    levels: Levels,
+}
+
+impl Customizer<'_> {
+    /// Customize `weights` into a freshly allocated [`Metric`].
+    ///
+    /// # Panics
+    /// Panics if `weights.len()` != the number of input arcs.
+    #[must_use]
+    pub fn customize(&self, weights: &[u32]) -> Metric {
+        let arc_count = self.cch.cch_arc_count();
+        let mut out = Metric {
+            forward: vec![INF_WEIGHT; arc_count],
+            backward: vec![INF_WEIGHT; arc_count],
+        };
+        self.customize_into(weights, &mut out);
+        out
+    }
+
+    /// Customize `weights`, reusing `out`'s `forward`/`backward` allocations.
+    /// On return, `out` holds the customized metric for `weights`. No allocation
+    /// occurs when `out`'s buffers already have `cch_arc_count` capacity.
+    ///
+    /// # Panics
+    /// Panics if `weights.len()` != the number of input arcs.
+    pub fn customize_into(&self, weights: &[u32], out: &mut Metric) {
+        let cch = self.cch;
         assert_eq!(
             weights.len(),
-            self.input_arc_to_cch_arc.len(),
+            cch.input_arc_to_cch_arc.len(),
             "weights length must equal input arc count"
         );
+        let arc_count = cch.cch_arc_count();
 
-        let arc_count = self.cch_arc_count();
-        let mut forward = vec![INF_WEIGHT; arc_count];
-        let mut backward = vec![INF_WEIGHT; arc_count];
+        // Reuse buffers: resize to arc_count and reset every slot to INF_WEIGHT.
+        out.forward.clear();
+        out.forward.resize(arc_count, INF_WEIGHT);
+        out.backward.clear();
+        out.backward.resize(arc_count, INF_WEIGHT);
+        let forward = &mut out.forward;
+        let backward = &mut out.backward;
 
-        // Phase 1: reset (extract_initial_metric, C++ 659–690).
+        // Phase 1: reset (extract_initial_metric).
         for cch_arc in 0..arc_count {
-            let fwd_in = self.forward_input_arc_of_cch[cch_arc];
+            let fwd_in = cch.forward_input_arc_of_cch[cch_arc];
             if fwd_in != INVALID_ID {
                 forward[cch_arc] = weights[fwd_in as usize];
             }
-            let bwd_in = self.backward_input_arc_of_cch[cch_arc];
+            let bwd_in = cch.backward_input_arc_of_cch[cch_arc];
             if bwd_in != INVALID_ID {
                 backward[cch_arc] = weights[bwd_in as usize];
             }
-            // Parallel-arc minimum over the extra (overflow) lists.
-            let ef = &self.first_extra_forward_input_arc_of_cch;
+            let ef = &cch.first_extra_forward_input_arc_of_cch;
             for j in ef[cch_arc]..ef[cch_arc + 1] {
-                let ia = self.extra_forward_input_arc_of_cch[j as usize] as usize;
+                let ia = cch.extra_forward_input_arc_of_cch[j as usize] as usize;
                 min_to(&mut forward[cch_arc], weights[ia]);
             }
-            let eb = &self.first_extra_backward_input_arc_of_cch;
+            let eb = &cch.first_extra_backward_input_arc_of_cch;
             for j in eb[cch_arc]..eb[cch_arc + 1] {
-                let ia = self.extra_backward_input_arc_of_cch[j as usize] as usize;
+                let ia = cch.extra_backward_input_arc_of_cch[j as usize] as usize;
                 min_to(&mut backward[cch_arc], weights[ia]);
             }
         }
 
-        // Phase 2: lower-triangle relaxation (C++ 778–798).
-        let node_count = self.node_count();
+        // Phase 2: lower-triangle relaxation (serial; parallelized in a later task).
+        let node_count = cch.node_count();
         let mut arc_id_cache = vec![0u32; node_count];
         for x in 0..node_count {
-            let xz_up_end = self.up_first_out[x + 1];
-            for xz_up in self.up_first_out[x]..xz_up_end {
-                arc_id_cache[self.up_head[xz_up as usize] as usize] = xz_up;
+            for xz_up in cch.up_first_out[x]..cch.up_first_out[x + 1] {
+                arc_id_cache[cch.up_head[xz_up as usize] as usize] = xz_up;
             }
-
-            let xy_down_end = self.down_first_out[x + 1];
-            for xy_down in self.down_first_out[x]..xy_down_end {
-                // `bottom` = the y→x up-arc; `y` = the lower triangle apex node.
-                let bottom = self.down_to_up[xy_down as usize] as usize;
-                let y = self.down_head[xy_down as usize] as usize;
-                let y_up_begin = self.up_first_out[y];
-                let mut cursor = self.up_first_out[y + 1];
+            for xy_down in cch.down_first_out[x]..cch.down_first_out[x + 1] {
+                let bottom = cch.down_to_up[xy_down as usize] as usize;
+                let y = cch.down_head[xy_down as usize] as usize;
+                let y_up_begin = cch.up_first_out[y];
+                let mut cursor = cch.up_first_out[y + 1];
                 while cursor > y_up_begin {
                     cursor -= 1;
-                    // `mid` = the y→z up-arc; `z` = the triangle top node.
                     let mid = cursor as usize;
-                    let z = self.up_head[mid] as usize;
+                    let z = cch.up_head[mid] as usize;
                     if z <= x {
                         break;
                     }
                     let top = arc_id_cache[z] as usize;
-                    // min_to(forward[top],  backward[bottom] + forward[mid])
                     let fwd_candidate = add(backward[bottom], forward[mid]);
-                    // min_to(backward[top], forward[bottom]  + backward[mid])
                     let bwd_candidate = add(forward[bottom], backward[mid]);
                     min_to(&mut forward[top], fwd_candidate);
                     min_to(&mut backward[top], bwd_candidate);
                 }
             }
         }
-
-        Metric { forward, backward }
     }
 }
 
@@ -339,6 +387,60 @@ mod tests {
         let order = vec![0u32, 1];
         let c = Cch::build(&g, &order);
         let _ = c.customize(&[1, 2, 3]);
+    }
+
+    // customize_into into an empty Metric matches a fresh customize.
+    #[test]
+    fn customize_into_empty_matches_fresh() {
+        let g = csr(3, &[0, 0, 1, 2], &[1, 2, 0, 0]);
+        let order = vec![0u32, 1, 2];
+        let c = Cch::build(&g, &order);
+        let w = [3u32, 5, 4, 6];
+
+        let fresh = c.customize(&w);
+        let cust = c.customizer();
+        let mut out = Metric {
+            forward: Vec::new(),
+            backward: Vec::new(),
+        };
+        cust.customize_into(&w, &mut out);
+        assert_eq!(out, fresh);
+    }
+
+    // customize_into into an over-sized Metric overwrites cleanly (no stale tail).
+    #[test]
+    fn customize_into_oversized_matches_fresh() {
+        let g = csr(3, &[0, 0, 1, 2], &[1, 2, 0, 0]);
+        let order = vec![0u32, 1, 2];
+        let c = Cch::build(&g, &order);
+        let w = [3u32, 5, 4, 6];
+
+        let fresh = c.customize(&w);
+        let cust = c.customizer();
+        let mut out = Metric {
+            forward: vec![999; fresh.forward.len() + 5],
+            backward: vec![999; fresh.backward.len() + 5],
+        };
+        cust.customize_into(&w, &mut out);
+        assert_eq!(out, fresh);
+    }
+
+    // One Customizer reused across two different weight vectors gives the same
+    // results as two independent customize calls (no scratch bleed).
+    #[test]
+    fn customizer_reuse_no_bleed() {
+        let g = csr(3, &[0, 0, 1, 2], &[1, 2, 0, 0]);
+        let order = vec![0u32, 1, 2];
+        let c = Cch::build(&g, &order);
+        let w1 = [3u32, 5, 4, 6];
+        let w2 = [10u32, 1, 2, 20];
+
+        let cust = c.customizer();
+        let mut out = c.customize(&w1); // seed with anything
+        cust.customize_into(&w1, &mut out);
+        assert_eq!(out, c.customize(&w1));
+        cust.customize_into(&w2, &mut out);
+        assert_eq!(out, c.customize(&w2));
     }
 
     // A node's level is 1 + its elimination-tree parent-chain depth from a leaf:
