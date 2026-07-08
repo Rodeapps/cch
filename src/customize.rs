@@ -22,6 +22,15 @@ use crate::INF_WEIGHT;
 use crate::bundle::INVALID_ID;
 use crate::structure::Cch;
 use rayon::prelude::*;
+use std::cell::RefCell;
+
+thread_local! {
+    // Per-worker scratch for `relax_node`: maps node id -> the current node's
+    // up-arc id to that node. Reused across levels and across customizations;
+    // grown on demand. Never read stale (see `relax_node`'s chordal argument:
+    // each node overwrites every slot it later reads).
+    static ARC_ID_CACHE: RefCell<Vec<u32>> = const { RefCell::new(Vec::new()) };
+}
 
 /// A customized metric: the forward + backward shortcut weights of every CCH
 /// arc. Field semantics match the persisted `.cch-metric` sections and
@@ -257,13 +266,18 @@ impl Cch {
     /// Customizes this CCH with per-INPUT-arc `weights`, producing the forward
     /// and backward shortcut weights of every CCH arc.
     ///
-    /// Bit-identical to `RoutingKit`'s `customize()`. For repeated customization
-    /// of the same structure, prefer [`Cch::customizer`] +
-    /// [`Customizer::customize_into`] to avoid re-allocating output buffers.
+    /// Bit-identical to `RoutingKit`'s `customize()`. Delegates to
+    /// [`Cch::customizer`], which re-validates structure and recomputes the
+    /// elimination-tree level partition on every call. For repeated
+    /// customization of the same structure, hold a [`Customizer`] (via
+    /// [`Cch::customizer`]) and reuse it with [`Customizer::customize`] /
+    /// [`Customizer::customize_into`] instead, to avoid re-validating,
+    /// re-partitioning, and re-allocating output buffers each call.
     ///
     /// # Panics
     /// Panics if `weights.len()` != the number of input arcs
-    /// (`self.input_arc_to_cch_arc.len()`).
+    /// (`self.input_arc_to_cch_arc.len()`), or if `self` is structurally
+    /// malformed (see [`Cch::customizer`]'s panics).
     #[must_use]
     pub fn customize(&self, weights: &[u32]) -> Metric {
         self.customizer().customize(weights)
@@ -355,15 +369,18 @@ impl Customizer<'_> {
         let levels = &self.levels;
         for l in 0..levels.first.len() - 1 {
             let level = &levels.nodes[levels.first[l] as usize..levels.first[l + 1] as usize];
-            level.par_iter().for_each_init(
-                || vec![0u32; node_count],
-                |cache, &x| {
+            level.par_iter().for_each(|&x| {
+                ARC_ID_CACHE.with(|c| {
+                    let mut cache = c.borrow_mut();
+                    if cache.len() < node_count {
+                        cache.resize(node_count, 0);
+                    }
                     // SAFETY: `arcs` upholds the `DisjointArcs` contract under this
                     // level-synchronized schedule; `cch` passed `customizer`
                     // validation; `x < node_count` (it is a node id from `levels`).
-                    unsafe { relax_node(x as usize, cache, &arcs, cch) };
-                },
-            );
+                    unsafe { relax_node(x as usize, &mut cache, &arcs, cch) };
+                });
+            });
         }
     }
 }
