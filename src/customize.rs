@@ -55,12 +55,7 @@ impl Metric {
 /// node id level-major (level 0 first); `first[l]..first[l+1]` slices `nodes`
 /// for level `l`.
 pub(crate) struct Levels {
-    // Consumed by the parallel relaxation added in a later task; `Customizer`
-    // already computes and stores a `Levels` (see `Cch::customizer`), but
-    // nothing walks `nodes`/`first` yet outside tests.
-    #[allow(dead_code)]
     pub nodes: Vec<u32>,
-    #[allow(dead_code)]
     pub first: Vec<u32>,
 }
 
@@ -132,13 +127,112 @@ fn min_to(x: &mut u32, y: u32) {
     }
 }
 
+/// Raw, `Send + Sync` pointers into the forward/backward arc-weight arrays for
+/// the parallel relaxation. Sharing these across rayon tasks is sound ONLY under
+/// the level-synchronized schedule in `customize_into`:
+///
+/// * Each task processes one node `x`; every write targets an **up-arc of `x`**
+///   (`top`), and up-arc id sets of distinct nodes are disjoint → no two tasks
+///   in a level write the same slot.
+/// * Reads (`forward[mid]`, `backward[bottom]`) are arcs of `x`'s down-neighbors,
+///   which sit in strictly-lower elimination-tree levels — finalized before this
+///   level runs and never written during it. A node in level `l` is never a
+///   down-neighbor of another level-`l` node, so no same-level task reads `x`'s
+///   arcs either.
+///
+/// Every index used is bounds-validated once in `Cch::customizer`, so `len` is an
+/// upper bound on all `top`/`mid`/`bottom` accesses.
+struct DisjointArcs {
+    forward: *mut u32,
+    backward: *mut u32,
+    len: usize,
+}
+// SAFETY: see the disjointness/finalization argument above; the sole caller
+// (`customize_into`'s level loop) upholds it.
+unsafe impl Send for DisjointArcs {}
+unsafe impl Sync for DisjointArcs {}
+
+/// Relax every lower triangle apexed at node `x`, writing the resulting
+/// candidates into `x`'s up-arc weights. `cache` is per-worker scratch reused
+/// across the nodes a worker handles; `x`'s first inner loop overwrites every
+/// slot it later reads (`z` is always an up-neighbor of `x` in a chordal CCH),
+/// so stale entries from a previously handled node are never read.
+///
+/// # Safety
+/// `arcs` must satisfy the `DisjointArcs` contract and `cch` must have passed
+/// `Cch::customizer`'s validation. `x` must be `< node_count`.
+unsafe fn relax_node(x: usize, cache: &mut [u32], arcs: &DisjointArcs, cch: &Cch) {
+    for xz_up in cch.up_first_out[x]..cch.up_first_out[x + 1] {
+        cache[cch.up_head[xz_up as usize] as usize] = xz_up;
+    }
+    for xy_down in cch.down_first_out[x]..cch.down_first_out[x + 1] {
+        let bottom = cch.down_to_up[xy_down as usize] as usize;
+        let y = cch.down_head[xy_down as usize] as usize;
+        let y_up_begin = cch.up_first_out[y];
+        let mut cursor = cch.up_first_out[y + 1];
+        while cursor > y_up_begin {
+            cursor -= 1;
+            let mid = cursor as usize;
+            let z = cch.up_head[mid] as usize;
+            if z <= x {
+                break;
+            }
+            let top = cache[z] as usize;
+            debug_assert!(top < arcs.len && mid < arcs.len && bottom < arcs.len);
+            // SAFETY: bottom/mid are arcs of the lower node `y` (finalized,
+            // read-only this level); top is an up-arc of `x` (written only by
+            // this task). All three indices are `< arcs.len` (validated).
+            let bwd_bottom = unsafe { *arcs.backward.add(bottom) };
+            let fwd_mid = unsafe { *arcs.forward.add(mid) };
+            let fwd_bottom = unsafe { *arcs.forward.add(bottom) };
+            let bwd_mid = unsafe { *arcs.backward.add(mid) };
+            let fwd_candidate = add(bwd_bottom, fwd_mid);
+            let bwd_candidate = add(fwd_bottom, bwd_mid);
+            // SAFETY: `top` is exclusive to this task (see `DisjointArcs`).
+            let fwd_top = unsafe { &mut *arcs.forward.add(top) };
+            min_to(fwd_top, fwd_candidate);
+            let bwd_top = unsafe { &mut *arcs.backward.add(top) };
+            min_to(bwd_top, bwd_candidate);
+        }
+    }
+}
+
 impl Cch {
     /// Build a reusable [`Customizer`] for this structure. Derives the
     /// elimination-tree level partition once; reuse the returned `Customizer`
     /// across many metrics to avoid recomputing it and to reuse output buffers
     /// via [`Customizer::customize_into`].
+    ///
+    /// # Panics
+    /// Panics if `self` is structurally malformed: a `up_head`/`down_head`
+    /// entry names a node id `>= node_count`, a `down_to_up` entry names an
+    /// arc id `>= cch_arc_count`, or `up_first_out[node_count] !=
+    /// cch_arc_count`. A `Cch` from [`Cch::build`] or `load_struct` always
+    /// satisfies these; this guards the parallel relaxation's raw-pointer
+    /// accesses against a hand-corrupted or foreign-loaded `Cch`.
     #[must_use]
     pub fn customizer(&self) -> Customizer<'_> {
+        // Soundness precondition for the parallel relaxation's `get_unchecked`/
+        // raw-pointer accesses (see `relax_node`): every head is a valid node id,
+        // every arc reference is a valid arc id, and the up-adjacency terminates
+        // at `cch_arc_count`. A `Cch` from `build`/`load_struct` satisfies this;
+        // validate it here so `relax_node` is sound however `self` was built.
+        let n = self.node_count();
+        let arc_count = self.cch_arc_count();
+        assert!(
+            self.up_head.iter().all(|&h| (h as usize) < n)
+                && self.down_head.iter().all(|&h| (h as usize) < n),
+            "malformed Cch: head contains a node id >= node_count"
+        );
+        assert!(
+            self.down_to_up.iter().all(|&a| (a as usize) < arc_count),
+            "malformed Cch: down_to_up contains an arc id >= cch_arc_count"
+        );
+        assert_eq!(
+            self.up_first_out.get(n).copied(),
+            u32::try_from(arc_count).ok(),
+            "malformed Cch: up_first_out[node_count] != cch_arc_count"
+        );
         Customizer {
             cch: self,
             levels: compute_levels(self),
@@ -166,9 +260,6 @@ impl Cch {
 /// it, and lets callers reuse output buffers via [`Self::customize_into`].
 pub struct Customizer<'a> {
     cch: &'a Cch,
-    // Consumed by the parallel relaxation added in a later task; retained now
-    // so callers don't recompute it across repeated `customize_into` calls.
-    #[allow(dead_code)]
     levels: Levels,
 }
 
@@ -237,12 +328,72 @@ impl Customizer<'_> {
                 }
             });
 
-        // Phase 2: lower-triangle relaxation (serial; parallelized in a later task).
+        // Phase 2: lower-triangle relaxation, level-synchronized parallelism.
+        // Levels run sequentially (barrier between); within a level, nodes run
+        // in parallel with provably-disjoint writes (see `DisjointArcs`).
         let node_count = cch.node_count();
-        let mut arc_id_cache = vec![0u32; node_count];
+        let arcs = DisjointArcs {
+            forward: forward.as_mut_ptr(),
+            backward: backward.as_mut_ptr(),
+            len: arc_count,
+        };
+        let levels = &self.levels;
+        for l in 0..levels.first.len() - 1 {
+            let level = &levels.nodes[levels.first[l] as usize..levels.first[l + 1] as usize];
+            level.par_iter().for_each_init(
+                || vec![0u32; node_count],
+                |cache, &x| {
+                    // SAFETY: `arcs` upholds the `DisjointArcs` contract under this
+                    // level-synchronized schedule; `cch` passed `customizer`
+                    // validation; `x < node_count` (it is a node id from `levels`).
+                    unsafe { relax_node(x as usize, cache, &arcs, cch) };
+                },
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::graph::Graph;
+
+    // Independent serial reference for the relaxation, retained ONLY for tests so
+    // the parallel path is checked against a non-parallel, non-oracle baseline.
+    // This is a faithful copy of the pre-parallel Phase-2 loop.
+    fn relax_serial(cch: &Cch, weights: &[u32]) -> Metric {
+        let arc_count = cch.cch_arc_count();
+        let mut forward = vec![INF_WEIGHT; arc_count];
+        let mut backward = vec![INF_WEIGHT; arc_count];
+        for cch_arc in 0..arc_count {
+            let fwd_in = cch.forward_input_arc_of_cch[cch_arc];
+            if fwd_in != INVALID_ID {
+                forward[cch_arc] = weights[fwd_in as usize];
+            }
+            let bwd_in = cch.backward_input_arc_of_cch[cch_arc];
+            if bwd_in != INVALID_ID {
+                backward[cch_arc] = weights[bwd_in as usize];
+            }
+            let ef = &cch.first_extra_forward_input_arc_of_cch;
+            for j in ef[cch_arc]..ef[cch_arc + 1] {
+                min_to(
+                    &mut forward[cch_arc],
+                    weights[cch.extra_forward_input_arc_of_cch[j as usize] as usize],
+                );
+            }
+            let eb = &cch.first_extra_backward_input_arc_of_cch;
+            for j in eb[cch_arc]..eb[cch_arc + 1] {
+                min_to(
+                    &mut backward[cch_arc],
+                    weights[cch.extra_backward_input_arc_of_cch[j as usize] as usize],
+                );
+            }
+        }
+        let node_count = cch.node_count();
+        let mut cache = vec![0u32; node_count];
         for x in 0..node_count {
             for xz_up in cch.up_first_out[x]..cch.up_first_out[x + 1] {
-                arc_id_cache[cch.up_head[xz_up as usize] as usize] = xz_up;
+                cache[cch.up_head[xz_up as usize] as usize] = xz_up;
             }
             for xy_down in cch.down_first_out[x]..cch.down_first_out[x + 1] {
                 let bottom = cch.down_to_up[xy_down as usize] as usize;
@@ -256,21 +407,16 @@ impl Customizer<'_> {
                     if z <= x {
                         break;
                     }
-                    let top = arc_id_cache[z] as usize;
-                    let fwd_candidate = add(backward[bottom], forward[mid]);
-                    let bwd_candidate = add(forward[bottom], backward[mid]);
-                    min_to(&mut forward[top], fwd_candidate);
-                    min_to(&mut backward[top], bwd_candidate);
+                    let top = cache[z] as usize;
+                    let fc = add(backward[bottom], forward[mid]);
+                    let bc = add(forward[bottom], backward[mid]);
+                    min_to(&mut forward[top], fc);
+                    min_to(&mut backward[top], bc);
                 }
             }
         }
+        Metric { forward, backward }
     }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::graph::Graph;
 
     #[test]
     fn metric_view_borrows_fields() {
@@ -406,6 +552,57 @@ mod tests {
         let _ = c.customize(&[1, 2, 3]);
     }
 
+    // customizer() validates structural soundness before handing out raw
+    // pointers to the parallel relaxation. Cover each assertion branch with a
+    // hand-corrupted Cch (as would result from loading arbitrary/corrupt bytes).
+
+    #[test]
+    #[should_panic(expected = "malformed Cch: head contains a node id >= node_count")]
+    #[allow(clippy::cast_possible_truncation)] // tiny fixture: node_count fits u32
+    fn customizer_rejects_out_of_range_up_head() {
+        let g = csr(3, &[0, 0, 1, 2], &[1, 2, 0, 0]);
+        let order = vec![0u32, 1, 2];
+        let mut c = Cch::build(&g, &order);
+        let n = c.node_count();
+        c.up_head[0] = n as u32; // one past the last valid node id
+        let _ = c.customizer();
+    }
+
+    #[test]
+    #[should_panic(expected = "malformed Cch: head contains a node id >= node_count")]
+    #[allow(clippy::cast_possible_truncation)] // tiny fixture: node_count fits u32
+    fn customizer_rejects_out_of_range_down_head() {
+        let g = csr(3, &[0, 0, 1, 2], &[1, 2, 0, 0]);
+        let order = vec![0u32, 1, 2];
+        let mut c = Cch::build(&g, &order);
+        let n = c.node_count();
+        c.down_head[0] = n as u32;
+        let _ = c.customizer();
+    }
+
+    #[test]
+    #[should_panic(expected = "malformed Cch: down_to_up contains an arc id >= cch_arc_count")]
+    #[allow(clippy::cast_possible_truncation)] // tiny fixture: arc_count fits u32
+    fn customizer_rejects_out_of_range_down_to_up() {
+        let g = csr(3, &[0, 0, 1, 2], &[1, 2, 0, 0]);
+        let order = vec![0u32, 1, 2];
+        let mut c = Cch::build(&g, &order);
+        let arc_count = c.cch_arc_count();
+        c.down_to_up[0] = arc_count as u32;
+        let _ = c.customizer();
+    }
+
+    #[test]
+    #[should_panic(expected = "malformed Cch: up_first_out[node_count] != cch_arc_count")]
+    fn customizer_rejects_bad_up_first_out_tail() {
+        let g = csr(3, &[0, 0, 1, 2], &[1, 2, 0, 0]);
+        let order = vec![0u32, 1, 2];
+        let mut c = Cch::build(&g, &order);
+        let last = c.up_first_out.len() - 1;
+        c.up_first_out[last] += 1;
+        let _ = c.customizer();
+    }
+
     // customize_into into an empty Metric matches a fresh customize.
     #[test]
     fn customize_into_empty_matches_fresh() {
@@ -499,5 +696,85 @@ mod tests {
                 );
             }
         }
+    }
+
+    // Build a 5x5 bidirectional grid so the elimination tree has several levels,
+    // then assert the parallel relaxation equals an independent serial reference
+    // arc-for-arc, on multiple random-ish weight vectors.
+    fn grid(side: u32) -> Graph {
+        let n = side * side;
+        let mut tail = Vec::new();
+        let mut head = Vec::new();
+        let idx = |r: u32, col: u32| r * side + col;
+        for r in 0..side {
+            for col in 0..side {
+                if col + 1 < side {
+                    tail.push(idx(r, col));
+                    head.push(idx(r, col + 1));
+                    tail.push(idx(r, col + 1));
+                    head.push(idx(r, col));
+                }
+                if r + 1 < side {
+                    tail.push(idx(r, col));
+                    head.push(idx(r + 1, col));
+                    tail.push(idx(r + 1, col));
+                    head.push(idx(r, col));
+                }
+            }
+        }
+        csr(n as usize, &tail, &head)
+    }
+
+    #[test]
+    #[allow(clippy::cast_possible_truncation)] // 5x5 grid: arc/node counts are tiny
+    fn parallel_relax_equals_serial_reference() {
+        let g = grid(5);
+        let order: Vec<u32> = (0..(g.first_out.len() as u32 - 1)).collect();
+        let c = Cch::build(&g, &order);
+        let input_arcs = c.input_arc_to_cch_arc.len();
+
+        for seed in [1u32, 7, 13, 99] {
+            let weights: Vec<u32> = (0..input_arcs as u32)
+                .map(|i| 1 + (i.wrapping_mul(2_654_435_761).wrapping_add(seed) % 97))
+                .collect();
+            let parallel = c.customize(&weights);
+            let reference = relax_serial(&c, &weights);
+            assert_eq!(parallel.forward, reference.forward, "seed {seed} forward");
+            assert_eq!(
+                parallel.backward, reference.backward,
+                "seed {seed} backward"
+            );
+        }
+    }
+
+    // Determinism: the parallel path yields byte-identical output across runs.
+    #[test]
+    #[allow(clippy::cast_possible_truncation)] // 5x5 grid: arc/node counts are tiny
+    fn parallel_relax_is_deterministic() {
+        let g = grid(5);
+        let order: Vec<u32> = (0..(g.first_out.len() as u32 - 1)).collect();
+        let c = Cch::build(&g, &order);
+        let weights: Vec<u32> = (0..c.input_arc_to_cch_arc.len() as u32)
+            .map(|i| 1 + i % 50)
+            .collect();
+        let a = c.customize(&weights);
+        let b = c.customize(&weights);
+        assert_eq!(a, b);
+    }
+
+    // relax_serial's extra-forward/extra-backward min-combine branches (the
+    // reset half of the reference) only trigger when an up-arc has parallel
+    // input arcs; exercise that here so the serial reference itself is fully
+    // covered, matching the parallel path on the same fixture.
+    #[test]
+    fn relax_serial_matches_parallel_with_parallel_arcs() {
+        let g = csr(2, &[0, 0, 1, 1], &[1, 1, 0, 0]);
+        let order = vec![0u32, 1];
+        let c = Cch::build(&g, &order);
+        let weights = [50u32, 9, 40, 8];
+        let parallel = c.customize(&weights);
+        let reference = relax_serial(&c, &weights);
+        assert_eq!(parallel.forward, reference.forward);
+        assert_eq!(parallel.backward, reference.backward);
     }
 }
