@@ -128,8 +128,10 @@ fn min_to(x: &mut u32, y: u32) {
 }
 
 /// Raw, `Send + Sync` pointers into the forward/backward arc-weight arrays for
-/// the parallel relaxation. Sharing these across rayon tasks is sound ONLY under
-/// the level-synchronized schedule in `customize_into`:
+/// the parallel relaxation. Sharing these across rayon tasks is data-race-free
+/// ONLY for a well-formed (chordal) CCH — as produced by `Cch::build` or a
+/// faithful `load_struct` round-trip — under the level-synchronized schedule in
+/// `customize_into`:
 ///
 /// * Each task processes one node `x`; every write targets an **up-arc of `x`**
 ///   (`top`), and up-arc id sets of distinct nodes are disjoint → no two tasks
@@ -140,8 +142,10 @@ fn min_to(x: &mut u32, y: u32) {
 ///   down-neighbor of another level-`l` node, so no same-level task reads `x`'s
 ///   arcs either.
 ///
-/// Every index used is bounds-validated once in `Cch::customizer`, so `len` is an
-/// upper bound on all `top`/`mid`/`bottom` accesses.
+/// This disjointness argument depends on chordality; a bounds-valid but
+/// non-chordal `Cch` is out of scope (see `Cch::customizer`). Every index used
+/// is bounds-validated once in `Cch::customizer`, so `len` is an upper bound on
+/// all `top`/`mid`/`bottom` accesses regardless.
 struct DisjointArcs {
     forward: *mut u32,
     backward: *mut u32,
@@ -159,8 +163,11 @@ unsafe impl Sync for DisjointArcs {}
 /// so stale entries from a previously handled node are never read.
 ///
 /// # Safety
-/// `arcs` must satisfy the `DisjointArcs` contract and `cch` must have passed
-/// `Cch::customizer`'s validation. `x` must be `< node_count`.
+/// `cch` must be a well-formed (chordal) `Cch` — as produced by `Cch::build` or
+/// a faithful `load_struct` round-trip — that has also passed
+/// `Cch::customizer`'s bounds validation, so that `arcs` (derived from that
+/// same `cch`) satisfies the `DisjointArcs` contract. `x` must be
+/// `< node_count`.
 unsafe fn relax_node(x: usize, cache: &mut [u32], arcs: &DisjointArcs, cch: &Cch) {
     for xz_up in cch.up_first_out[x]..cch.up_first_out[x + 1] {
         cache[cch.up_head[xz_up as usize] as usize] = xz_up;
@@ -207,16 +214,24 @@ impl Cch {
     /// Panics if `self` is structurally malformed: a `up_head`/`down_head`
     /// entry names a node id `>= node_count`, a `down_to_up` entry names an
     /// arc id `>= cch_arc_count`, or `up_first_out[node_count] !=
-    /// cch_arc_count`. A `Cch` from [`Cch::build`] or `load_struct` always
-    /// satisfies these; this guards the parallel relaxation's raw-pointer
-    /// accesses against a hand-corrupted or foreign-loaded `Cch`.
+    /// cch_arc_count`. These asserts guard the parallel relaxation's
+    /// raw-pointer accesses against out-of-bounds indexing for any
+    /// bounds-valid `Cch`; they do NOT establish chordality. The parallel
+    /// relaxation's correctness and data-race-freedom additionally require
+    /// `self` to be well-formed (chordal), which every `Cch` from
+    /// [`Cch::build`] or a faithful `load_struct` round-trip is. A
+    /// deliberately corrupted, bounds-valid but non-chordal `Cch` is outside
+    /// this safety contract.
     #[must_use]
     pub fn customizer(&self) -> Customizer<'_> {
-        // Soundness precondition for the parallel relaxation's `get_unchecked`/
-        // raw-pointer accesses (see `relax_node`): every head is a valid node id,
-        // every arc reference is a valid arc id, and the up-adjacency terminates
-        // at `cch_arc_count`. A `Cch` from `build`/`load_struct` satisfies this;
-        // validate it here so `relax_node` is sound however `self` was built.
+        // Bounds precondition for the parallel relaxation's raw-pointer
+        // `.add()` accesses (see `relax_node`): every head is a valid node id,
+        // every arc reference is a valid arc id, and the up-adjacency
+        // terminates at `cch_arc_count`. This rules out out-of-bounds access
+        // for any bounds-valid `Cch`; it does not establish chordality, which
+        // `relax_node`'s data-race-freedom additionally requires (see
+        // `DisjointArcs`) and which every `Cch` from `build`/`load_struct`
+        // satisfies.
         let n = self.node_count();
         let arc_count = self.cch_arc_count();
         assert!(
