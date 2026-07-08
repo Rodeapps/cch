@@ -6,6 +6,10 @@ Cargo.lock
 
 # Local-only design/plan docs (not part of the published crate)
 /.plans/
+/docs/superpowers/
+
+# JetBrains IDE files
+/.idea/
 
 # Local-only tooling scratch (not part of the published crate)
 /.superpowers/
