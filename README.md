@@ -14,7 +14,7 @@ It is a from-scratch Rust reimplementation of [RoutingKit](https://github.com/Ro
 
 ```toml
 [dependencies]
-cch = "0.1"
+cch = "0.2"
 ```
 
 ## Quick start
