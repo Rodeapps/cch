@@ -12,6 +12,16 @@
 //! construction and bundle format are bit-identical to `RoutingKit`, so bundles
 //! interoperate with existing artifacts.
 //!
+//! Customization runs in parallel internally (via [rayon](https://docs.rs/rayon)).
+//! For a one-off metric, [`Cch::customize`] is a thin wrapper that is all you
+//! need. For repeated re-customization of the same structure — e.g. re-solving
+//! for many weight profiles, or refreshing live traffic weights — build a
+//! [`Customizer`] once with [`Cch::customizer`] and call
+//! [`Customizer::customize_into`] on each new weight vector: it reuses the
+//! output buffers (no allocation once they're sized) and the precomputed
+//! elimination-tree level partition, producing output bit-identical to
+//! [`Cch::customize`].
+//!
 //! Two contraction-order heuristics are provided: a lightweight degree order
 //! ([`degree_order`]) and inertial-flow (geometric) nested dissection
 //! ([`inertial_order`]), which yields far higher-quality hierarchies on road
@@ -74,7 +84,7 @@ pub mod structure;
 mod writer;
 
 pub use bundle::{CchBundle, CchView, MetricBundle, MetricView};
-pub use customize::Metric;
+pub use customize::{Customizer, Metric};
 pub use order::{degree_order, inertial_order};
 pub use path::{PathQuery, node_path};
 pub use query::{ElimTreeQuery, distance_matrix};

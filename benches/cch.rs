@@ -185,6 +185,39 @@ fn bench_customize(c: &mut Criterion) {
 }
 
 // ---------------------------------------------------------------------------
+// Bench: customize_reuse  (fresh Cch::customize per call vs a reused
+// Customizer::customize_into, both on the Rust side only)
+// ---------------------------------------------------------------------------
+
+fn bench_customize_reuse(c: &mut Criterion) {
+    let (n, tail, head, weights) = make_grid(24, 24);
+    let graph = csr_from_arcs(n, &tail, &head);
+    let order = cch::degree_order(&graph);
+    let cch = cch::Cch::build(&graph, &order);
+
+    let mut g: BenchmarkGroup<WallTime> = c.benchmark_group("customize_reuse/24x24");
+    g.sample_size(50);
+
+    g.bench_function(BenchmarkId::new("fresh_each_call", ""), |b| {
+        b.iter(|| {
+            let m = cch.customize(black_box(&weights));
+            black_box(m);
+        });
+    });
+
+    g.bench_function(BenchmarkId::new("reused_customizer", ""), |b| {
+        let cust = cch.customizer();
+        let mut metric = cch.customize(&weights);
+        b.iter(|| {
+            cust.customize_into(black_box(&weights), &mut metric);
+            black_box(&metric);
+        });
+    });
+
+    g.finish();
+}
+
+// ---------------------------------------------------------------------------
 // Bench: distance_matrix  (all 576 nodes as sources AND targets = 576×576)
 // ---------------------------------------------------------------------------
 
@@ -505,6 +538,7 @@ criterion_group!(
     bench_degree_order,
     bench_build,
     bench_customize,
+    bench_customize_reuse,
     bench_distance_matrix,
     bench_node_path,
     bench_path_query,

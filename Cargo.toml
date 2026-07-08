@@ -1,9 +1,9 @@
 [package]
 name = "cch"
-version = "0.1.1"
+version = "0.2.0"
 edition = "2024"
 license = "MIT"
-description = "Pure-Rust Customizable Contraction Hierarchies (CCH): build, customize, and serve fast shortest-path distance, many-to-many matrix, and path queries on road networks"
+description = "Pure-Rust Customizable Contraction Hierarchies (CCH): build, customize in parallel, and serve fast shortest-path distance, many-to-many matrix, and path queries on road networks"
 repository = "https://github.com/Rodeapps/cch"
 homepage = "https://github.com/Rodeapps/cch"
 documentation = "https://docs.rs/cch"
@@ -19,6 +19,7 @@ exclude = ["oracle/", ".github/", ".superpowers/", ".plans/", ".claude/"]
 
 [dependencies]
 memmap2 = "0.9"
+rayon = "1.10"
 
 [dev-dependencies]
 routingkit-cch = { path = "oracle/routingkit-cch" }
