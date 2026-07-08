@@ -19,6 +19,7 @@ exclude = ["oracle/", ".github/", ".superpowers/", ".plans/", ".claude/"]
 
 [dependencies]
 memmap2 = "0.9"
+rayon = "1.10"
 
 [dev-dependencies]
 routingkit-cch = { path = "oracle/routingkit-cch" }

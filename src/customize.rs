@@ -48,6 +48,62 @@ impl Metric {
     }
 }
 
+/// Elimination-tree level partition of a [`Cch`], grouping nodes by height so
+/// that same-level nodes have no ancestor/descendant relationship. Derived once
+/// (metric-independent) and reused across customizations. `nodes` lists every
+/// node id level-major (level 0 first); `first[l]..first[l+1]` slices `nodes`
+/// for level `l`.
+// `Levels`/`compute_levels` are wired into `Cch::customize` by a following
+// task; kept unused-but-tested here so this step stays reviewable on its own.
+#[allow(dead_code)]
+pub(crate) struct Levels {
+    pub nodes: Vec<u32>,
+    pub first: Vec<u32>,
+}
+
+/// Compute the elimination-tree height of every node and bucket nodes by height.
+///
+/// `height[x] = 0` for a node with no elim-tree children, else
+/// `1 + max(height[child])`. Because `elimination_tree_parent[x]` always has a
+/// strictly higher rank than `x`, iterating `x` in increasing rank finalizes
+/// `height[x]` before it is read as a child (all children have lower rank).
+#[allow(dead_code)]
+pub(crate) fn compute_levels(cch: &Cch) -> Levels {
+    let n = cch.node_count();
+    let mut height = vec![0u32; n];
+    let mut num_levels = 1u32; // at least level 0 (or 0 nodes -> unused)
+    for (x, &p) in cch.elimination_tree_parent.iter().enumerate() {
+        if p != INVALID_ID {
+            let cand = height[x] + 1;
+            if cand > height[p as usize] {
+                height[p as usize] = cand;
+            }
+        }
+        if height[x] + 1 > num_levels {
+            num_levels = height[x] + 1;
+        }
+    }
+
+    // CSR bucket by height.
+    let mut first = vec![0u32; num_levels as usize + 1];
+    for &h in &height {
+        first[h as usize + 1] += 1;
+    }
+    for l in 0..num_levels as usize {
+        first[l + 1] += first[l];
+    }
+    let mut cursor: Vec<u32> = first[..num_levels as usize].to_vec();
+    let mut nodes = vec![0u32; n];
+    #[allow(clippy::cast_possible_truncation)] // node ids fit u32 (CCH limit)
+    for (x, &h) in height.iter().enumerate() {
+        let l = h as usize;
+        nodes[cursor[l] as usize] = x as u32;
+        cursor[l] += 1;
+    }
+
+    Levels { nodes, first }
+}
+
 /// Saturating addition against [`INF_WEIGHT`].
 ///
 /// Matches the C++ exactly: it adds raw `unsigned`s, but since
@@ -283,5 +339,46 @@ mod tests {
         let order = vec![0u32, 1];
         let c = Cch::build(&g, &order);
         let _ = c.customize(&[1, 2, 3]);
+    }
+
+    // A node's level is 1 + its elimination-tree parent-chain depth from a leaf:
+    // level(x) = 0 if x has no elim-tree descendant, else max(level(child))+1.
+    // Every node appears exactly once; a node's level must exceed every
+    // down-neighbor's level (down-neighbors are strictly-lower elim-tree nodes).
+    #[test]
+    fn levels_partition_is_valid() {
+        // path 1-0-2 (undirected), order [0,1,2]: elim tree 0->1->2 (root 2).
+        let g = csr(3, &[0, 0, 1, 2], &[1, 2, 0, 0]);
+        let order = vec![0u32, 1, 2];
+        let c = Cch::build(&g, &order);
+        let levels = compute_levels(&c);
+
+        // every node present exactly once
+        let mut seen = levels.nodes.clone();
+        seen.sort_unstable();
+        assert_eq!(seen, vec![0, 1, 2]);
+
+        // first[] is a valid CSR offset array over nodes
+        assert_eq!(*levels.first.first().unwrap(), 0);
+        assert_eq!(*levels.first.last().unwrap(), 3);
+
+        // per-node level lookup
+        let mut level_of = vec![0u32; c.node_count()];
+        #[allow(clippy::cast_possible_truncation)] // levels count is tiny (3) in this test
+        for l in 0..levels.first.len() - 1 {
+            for &x in &levels.nodes[levels.first[l] as usize..levels.first[l + 1] as usize] {
+                level_of[x as usize] = l as u32;
+            }
+        }
+        // each down-neighbor is strictly lower level than its node
+        for x in 0..c.node_count() {
+            for d in c.down_first_out[x]..c.down_first_out[x + 1] {
+                let y = c.down_head[d as usize] as usize;
+                assert!(
+                    level_of[y] < level_of[x],
+                    "down-neighbor must be lower level"
+                );
+            }
+        }
     }
 }
