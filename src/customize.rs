@@ -21,6 +21,7 @@
 use crate::INF_WEIGHT;
 use crate::bundle::INVALID_ID;
 use crate::structure::Cch;
+use rayon::prelude::*;
 
 /// A customized metric: the forward + backward shortcut weights of every CCH
 /// arc. Field semantics match the persisted `.cch-metric` sections and
@@ -210,27 +211,31 @@ impl Customizer<'_> {
         let forward = &mut out.forward;
         let backward = &mut out.backward;
 
-        // Phase 1: reset (extract_initial_metric).
-        for cch_arc in 0..arc_count {
-            let fwd_in = cch.forward_input_arc_of_cch[cch_arc];
-            if fwd_in != INVALID_ID {
-                forward[cch_arc] = weights[fwd_in as usize];
-            }
-            let bwd_in = cch.backward_input_arc_of_cch[cch_arc];
-            if bwd_in != INVALID_ID {
-                backward[cch_arc] = weights[bwd_in as usize];
-            }
-            let ef = &cch.first_extra_forward_input_arc_of_cch;
-            for j in ef[cch_arc]..ef[cch_arc + 1] {
-                let ia = cch.extra_forward_input_arc_of_cch[j as usize] as usize;
-                min_to(&mut forward[cch_arc], weights[ia]);
-            }
-            let eb = &cch.first_extra_backward_input_arc_of_cch;
-            for j in eb[cch_arc]..eb[cch_arc + 1] {
-                let ia = cch.extra_backward_input_arc_of_cch[j as usize] as usize;
-                min_to(&mut backward[cch_arc], weights[ia]);
-            }
-        }
+        // Phase 1: reset (extract_initial_metric) — arcs are independent.
+        forward
+            .par_iter_mut()
+            .zip(backward.par_iter_mut())
+            .enumerate()
+            .for_each(|(cch_arc, (fwd, bwd))| {
+                let fwd_in = cch.forward_input_arc_of_cch[cch_arc];
+                if fwd_in != INVALID_ID {
+                    *fwd = weights[fwd_in as usize];
+                }
+                let bwd_in = cch.backward_input_arc_of_cch[cch_arc];
+                if bwd_in != INVALID_ID {
+                    *bwd = weights[bwd_in as usize];
+                }
+                let ef = &cch.first_extra_forward_input_arc_of_cch;
+                for j in ef[cch_arc]..ef[cch_arc + 1] {
+                    let ia = cch.extra_forward_input_arc_of_cch[j as usize] as usize;
+                    min_to(fwd, weights[ia]);
+                }
+                let eb = &cch.first_extra_backward_input_arc_of_cch;
+                for j in eb[cch_arc]..eb[cch_arc + 1] {
+                    let ia = cch.extra_backward_input_arc_of_cch[j as usize] as usize;
+                    min_to(bwd, weights[ia]);
+                }
+            });
 
         // Phase 2: lower-triangle relaxation (serial; parallelized in a later task).
         let node_count = cch.node_count();
@@ -377,6 +382,18 @@ mod tests {
         // two infs sum to 2^32-2, which is > INF_WEIGHT (stays unreachable).
         let s = add(INF_WEIGHT, INF_WEIGHT);
         assert!(s > INF_WEIGHT);
+    }
+
+    // Reset must min-combine parallel/extra input arcs identically under rayon.
+    // Two 0->1 arcs (w=50,9) and two 1->0 arcs (w=40,8): min wins per direction.
+    #[test]
+    fn parallel_reset_min_combines() {
+        let g = csr(2, &[0, 0, 1, 1], &[1, 1, 0, 0]);
+        let order = vec![0u32, 1];
+        let c = Cch::build(&g, &order);
+        let m = c.customizer().customize(&[50, 9, 40, 8]);
+        assert_eq!(m.forward, vec![9]);
+        assert_eq!(m.backward, vec![8]);
     }
 
     // customize panics on wrong weight length.
