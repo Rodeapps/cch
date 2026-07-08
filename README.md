@@ -41,6 +41,10 @@ let cch = Cch::build(&graph, &order);
 // 3. Customize a metric (cheap — repeat per weight profile).
 let metric = cch.customize(&graph.weight);
 
+// For repeated re-customization, reuse buffers:
+// let cust = cch.customizer();
+// cust.customize_into(&graph.weight, &mut metric);
+
 // 4. Query in memory, via zero-copy views.
 let dm = distance_matrix(&cch.view(), &metric.view(), &[0], &[3]);
 assert_eq!(dm[0], 3); // shortest distance 0 -> 3
@@ -61,8 +65,9 @@ The expensive build is amortized across many cheap customizations, which is exac
 
 ## Highlights
 
-- **Pure Rust, no FFI.** The published library has zero C++ in its dependency tree — embed it in a Rust service with no C/C++ toolchain. (A C++ RoutingKit build is used *only* as a dev-time differential-test oracle; it is not part of the crate you depend on.)
+- **Pure Rust, no FFI.** The published library has zero C++ in its dependency tree — embed it in a Rust service with no C/C++ toolchain. (Parallel customization uses [rayon](https://github.com/rayon-rs/rayon), also pure Rust. A C++ RoutingKit build is used *only* as a dev-time differential-test oracle; it is not part of the crate you depend on.)
 - **The complete pipeline** — contraction order, structure build, per-metric customization, bundle reader **and** writer, distance / distance-matrix / path queries, and shortcut unpacking.
+- **Parallel, reusable customization.** `Cch::customizer` builds a [`Customizer`](https://docs.rs/cch/latest/cch/struct.Customizer.html) once per structure; `Customizer::customize_into` re-customizes for a new weight profile without reallocating output buffers, with both phases of customization running in parallel — bit-identical to the serial, single-shot `Cch::customize`.
 - **Two ordering strategies** — a lightweight `degree_order`, and **`inertial_order`**: a full geometric nested-dissection (inertial-flow max-flow / min-cut) that produces hierarchies of the *same quality as RoutingKit* (identical shortcut counts in testing).
 - **Zero-copy mmap bundles.** Build once, write `.cch-struct` / `.cch-metric` files, then serve them memory-mapped — the OS page cache backs the query slices directly, so many regions can be served within a bounded memory budget. The format is byte-compatible with RoutingKit-produced bundles.
 - **Proven correct.** Every stage is gated by a differential test against the C++ oracle (see [Correctness](#correctness)).
@@ -113,6 +118,8 @@ Indicative numbers, Rust vs the C++ RoutingKit oracle, on a 24×24 bidirectional
 
 Every operation is at parity with (or faster than) RoutingKit. The query paths reach parity by eliding the per-arc bounds checks in the hot relaxation loops — the elision-able accesses via sliced iterators, and the data-dependent distance-array access via a `get_unchecked` guarded by a one-time structural validation. (Numbers are indicative; hardware is not standardized — run `cargo bench` for your own.)
 
+A `customize_reuse` bench compares a fresh `Cch::customize` per call against a reused `Customizer::customize_into` on the same grid; the reused path avoids re-deriving the level partition and re-allocating output buffers, so it is never slower and is typically a few percent faster (`cargo bench --bench cch -- customize` to reproduce). The gain grows with structure size and call frequency; on this modest 24×24 fixture the parallel overhead largely offsets the savings.
+
 ## Correctness
 
 The reference C++ RoutingKit is vendored as a **dev-only** differential-test oracle, and each stage of the pipeline is gated against it:
@@ -127,9 +134,9 @@ The whole crate maintains **100% line coverage**, enforced by a CI gate (`cargo 
 
 ## Status & roadmap
 
-`0.1` ships the full pipeline — both orderings, build, customize, bundle read/write, and all query types — validated against RoutingKit. The API may still evolve before `1.0`.
+`0.1` ships the full pipeline — both orderings, build, customize, bundle read/write, and all query types — validated against RoutingKit. Customization runs in parallel (via rayon) and supports buffer reuse across repeated calls through `Cch::customizer` / `Customizer::customize_into`, with no change to the bit-identical output. The API may still evolve before `1.0`.
 
-Planned: narrowing the query-path performance gap, parallel customization, and broader benchmark coverage on real continental graphs.
+Planned: narrowing the query-path performance gap and broader benchmark coverage on real continental graphs.
 
 ## Relationship to RoutingKit
 

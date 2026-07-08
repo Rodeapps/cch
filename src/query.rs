@@ -58,7 +58,7 @@ impl<'a> ElimTreeQuery<'a> {
     /// # Panics
     ///
     /// Panics if `cch` is malformed — specifically if any `up_head` value is not
-    /// a valid node id (`>= node_count`). A `CchView` from [`Cch::build`] or a
+    /// a valid node id (`>= node_count`). A `CchView` from [`Cch::build`](crate::Cch::build) or a
     /// [`CchBundle`](crate::CchBundle) always satisfies this.
     #[must_use]
     pub fn new(cch: &'a CchView<'a>) -> Self {
