@@ -120,6 +120,8 @@ Every operation is at parity with (or faster than) RoutingKit. The query paths r
 
 A `customize_reuse` bench compares a fresh `Cch::customize` per call against a reused `Customizer::customize_into` on the same grid; the reused path avoids re-deriving the level partition and re-allocating output buffers, so it is never slower and is typically a few percent faster (`cargo bench --bench cch -- customize` to reproduce). The gain grows with structure size and call frequency; on this modest 24×24 fixture the parallel overhead largely offsets the savings.
 
+Parallel customization is a **large-graph** win: on nested-dissection-ordered grids, `customize` runs ~1.85× faster at 65k nodes and ~2.8× at 656k nodes on 18 cores, with no benefit — and no measurable regression — below ~tens of thousands of nodes. The efficiency is sub-linear in cores: level-synchronized customization has a barrier per elimination-tree level, and the top of the hierarchy has too few nodes to fill many cores. Grids are a pessimistic proxy (worse separators than real road networks), so treat these as a lower bound. Full method and numbers: [docs/customize-parallel-scaling.md](docs/customize-parallel-scaling.md).
+
 ## Correctness
 
 The reference C++ RoutingKit is vendored as a **dev-only** differential-test oracle, and each stage of the pipeline is gated against it:
