@@ -218,6 +218,64 @@ fn bench_customize_reuse(c: &mut Criterion) {
 }
 
 // ---------------------------------------------------------------------------
+// Bench: customize on LARGE grids (parallel scaling). Run with
+// RAYON_NUM_THREADS=1 vs all cores to isolate the parallel speedup. Uses
+// inertial_order (nested dissection) for a realistic, low-fill-in order.
+// ---------------------------------------------------------------------------
+
+#[allow(
+    clippy::cast_precision_loss,
+    reason = "grid coords are exact in f32 at these sizes"
+)]
+fn bench_customize_large(c: &mut Criterion) {
+    // Grid sides come from CCH_BENCH_SIDE (comma-separated) so a plain
+    // `cargo bench` stays fast and OOM-free; the big sizes build a large CCH
+    // (slow inertial_order + lots of RAM) and are opt-in, e.g.:
+    //   CCH_BENCH_SIDE=810 cargo bench --bench cch -- customize_large
+    // Node counts: 128->16k, 256->65k, 810->656k, 2561->6.56M, 8101->65.6M.
+    let sides: Vec<u32> = std::env::var("CCH_BENCH_SIDE").ok().map_or_else(
+        || vec![128u32, 256u32],
+        |s| {
+            s.split(',')
+                .filter_map(|x| x.trim().parse::<u32>().ok())
+                .collect()
+        },
+    );
+
+    let max_threads = rayon::current_num_threads();
+    let thread_counts: Vec<usize> = if max_threads > 1 {
+        vec![1, max_threads]
+    } else {
+        vec![1]
+    };
+
+    for &side in &sides {
+        let (n, tail, head, weights) = make_grid(side, side);
+        let graph = csr_from_arcs(n, &tail, &head);
+        let lat: Vec<f32> = (0..n).map(|v| (v / side) as f32).collect();
+        let lon: Vec<f32> = (0..n).map(|v| (v % side) as f32).collect();
+        let order = cch::inertial_order(n, &tail, &head, &lat, &lon);
+        let cch = cch::Cch::build(&graph, &order);
+
+        let mut g: BenchmarkGroup<WallTime> =
+            c.benchmark_group(format!("customize_large/{side}x{side}"));
+        g.sample_size(10);
+        // Build the CCH once; time customize under a single-thread and an
+        // all-cores rayon pool to isolate the parallel speedup.
+        for &threads in &thread_counts {
+            let pool = rayon::ThreadPoolBuilder::new()
+                .num_threads(threads)
+                .build()
+                .expect("build rayon pool");
+            g.bench_function(BenchmarkId::new("threads", threads), |b| {
+                b.iter(|| pool.install(|| black_box(cch.customize(black_box(&weights)))));
+            });
+        }
+        g.finish();
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Bench: distance_matrix  (all 576 nodes as sources AND targets = 576×576)
 // ---------------------------------------------------------------------------
 
@@ -539,6 +597,7 @@ criterion_group!(
     bench_build,
     bench_customize,
     bench_customize_reuse,
+    bench_customize_large,
     bench_distance_matrix,
     bench_node_path,
     bench_path_query,
