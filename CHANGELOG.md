@@ -5,6 +5,16 @@ All notable changes to this crate are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.0] - 2026-07-14
+
+### Added
+
+- `distance` — point-to-point shortest-path distance convenience wrapper.
+- `distances_from` — one-to-many shortest-path distances convenience wrapper.
+- Env-gated real-corpus benchmark (`benches/real_corpus.rs`, `CCH_CORPUS` /
+  `CCH_CORPUS_METRIC`) measuring customize parallel scaling and query latency on
+  a genuine road network.
+
 ## [0.2.0] - 2026-07-09
 
 ### Added
@@ -50,6 +60,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   distance / distance-matrix / shortest-path queries — validated bit-for-bit
   against RoutingKit.
 
+[0.3.0]: https://github.com/Rodeapps/cch/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/Rodeapps/cch/compare/v0.1.1...v0.2.0
 [0.1.1]: https://github.com/Rodeapps/cch/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/Rodeapps/cch/releases/tag/v0.1.0
