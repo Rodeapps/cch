@@ -317,7 +317,7 @@ pub fn distance_matrix(
 
 /// Point-to-point shortest-path distance from `source` to `target`.
 ///
-/// Returns [`INF_WEIGHT`](crate::INF_WEIGHT) if `target` is unreachable, and `0`
+/// Returns [`INF_WEIGHT`] if `target` is unreachable, and `0`
 /// when `source == target`. Convenience wrapper over [`distance_matrix`] with a
 /// single source and target.
 ///
@@ -330,13 +330,14 @@ pub fn distance(cch: &CchView, metric: &MetricView, source: u32, target: u32) ->
 
 /// One-to-many shortest-path distances from `source` to each of `targets`.
 ///
-/// Returns one entry per target, in input order; [`INF_WEIGHT`](crate::INF_WEIGHT)
+/// Returns one entry per target, in input order; [`INF_WEIGHT`]
 /// for unreachable targets. Returns an empty `Vec` when `targets` is empty.
 /// Convenience wrapper over [`distance_matrix`] with a single source (which pins
 /// the target set once and runs one forward search — the optimal one-to-many path).
 ///
 /// # Panics
 /// Panics if `source` or any target is `>= node_count` (same as [`distance_matrix`]).
+/// An empty `targets` slice returns an empty `Vec` without checking `source`.
 #[must_use]
 pub fn distances_from(
     cch: &CchView,
