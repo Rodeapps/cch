@@ -83,7 +83,7 @@ The expensive build is amortized across many cheap customizations, which is exac
 | Customize a metric | [`Cch::customize`](https://docs.rs/cch/latest/cch/struct.Cch.html#method.customize) → [`Metric`](https://docs.rs/cch/latest/cch/struct.Metric.html) |
 | Serialize / load | [`Cch::save_struct`](https://docs.rs/cch/latest/cch/struct.Cch.html#method.save_struct), [`Cch::load_struct`](https://docs.rs/cch/latest/cch/struct.Cch.html), [`Metric::save`](https://docs.rs/cch/latest/cch/struct.Metric.html#method.save) |
 | Open bundles (mmap) | [`CchBundle`](https://docs.rs/cch/latest/cch/struct.CchBundle.html), [`MetricBundle`](https://docs.rs/cch/latest/cch/struct.MetricBundle.html) |
-| Query | [`distance_matrix`](https://docs.rs/cch/latest/cch/fn.distance_matrix.html), [`node_path`](https://docs.rs/cch/latest/cch/fn.node_path.html), [`ElimTreeQuery`](https://docs.rs/cch/latest/cch/struct.ElimTreeQuery.html) |
+| Query | [`distance`](https://docs.rs/cch/latest/cch/fn.distance.html), [`distances_from`](https://docs.rs/cch/latest/cch/fn.distances_from.html), [`distance_matrix`](https://docs.rs/cch/latest/cch/fn.distance_matrix.html), [`node_path`](https://docs.rs/cch/latest/cch/fn.node_path.html), [`ElimTreeQuery`](https://docs.rs/cch/latest/cch/struct.ElimTreeQuery.html) |
 
 Unreachable distances are reported as [`cch::INF_WEIGHT`](https://docs.rs/cch/latest/cch/constant.INF_WEIGHT.html) (`2_147_483_647`). Queries take borrowed `CchView` / `MetricView`s, so you can query a freshly-built `Cch`/`Metric` in memory (`.view()`) or a memory-mapped bundle (`.view()` on `CchBundle`/`MetricBundle`) through the same functions.
 

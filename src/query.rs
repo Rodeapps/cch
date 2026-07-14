@@ -315,6 +315,38 @@ pub fn distance_matrix(
     out
 }
 
+/// Point-to-point shortest-path distance from `source` to `target`.
+///
+/// Returns [`INF_WEIGHT`](crate::INF_WEIGHT) if `target` is unreachable, and `0`
+/// when `source == target`. Convenience wrapper over [`distance_matrix`] with a
+/// single source and target.
+///
+/// # Panics
+/// Panics if `source` or `target` is `>= node_count` (same as [`distance_matrix`]).
+#[must_use]
+pub fn distance(cch: &CchView, metric: &MetricView, source: u32, target: u32) -> u32 {
+    distance_matrix(cch, metric, &[source], &[target])[0]
+}
+
+/// One-to-many shortest-path distances from `source` to each of `targets`.
+///
+/// Returns one entry per target, in input order; [`INF_WEIGHT`](crate::INF_WEIGHT)
+/// for unreachable targets. Returns an empty `Vec` when `targets` is empty.
+/// Convenience wrapper over [`distance_matrix`] with a single source (which pins
+/// the target set once and runs one forward search — the optimal one-to-many path).
+///
+/// # Panics
+/// Panics if `source` or any target is `>= node_count` (same as [`distance_matrix`]).
+#[must_use]
+pub fn distances_from(
+    cch: &CchView,
+    metric: &MetricView,
+    source: u32,
+    targets: &[u32],
+) -> Vec<u32> {
+    distance_matrix(cch, metric, &[source], targets)
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -587,5 +619,63 @@ mod tests {
         let mut out = vec![0u32; 1];
         q.get_distances_to_targets(&mut out);
         assert_eq!(out[0], crate::INF_WEIGHT);
+    }
+
+    // ---------------------------------------------------------------------------
+    // distance / distances_from
+    // ---------------------------------------------------------------------------
+
+    /// Small fixture for the `distance` / `distances_from` wrapper tests: a
+    /// pure-Rust (no C++ oracle) directed 4-node path 0->1->2->3 with
+    /// unit-weight arcs, built the same way as the crate-level doc example.
+    /// Because only the forward direction has arcs, the reverse direction
+    /// (e.g. 3->0) is unreachable — giving an `INF_WEIGHT` case for free.
+    fn build_query_fixture() -> (crate::Cch, crate::Metric) {
+        use crate::graph::Graph;
+        use crate::order::degree_order;
+
+        let graph = Graph {
+            first_out: vec![0, 1, 2, 3, 3],
+            head: vec![1, 2, 3],
+            weight: vec![1, 1, 1],
+        };
+        let order = degree_order(&graph);
+        let cch = crate::Cch::build(&graph, &order);
+        let metric = cch.customize(&graph.weight);
+        (cch, metric)
+    }
+
+    #[test]
+    fn distance_matches_matrix_and_self_is_zero() {
+        // Build the same small fixture the distance_matrix tests use.
+        let (cch, metric) = build_query_fixture();
+        let cv = cch.view();
+        let mv = metric.view();
+
+        // point-to-point equals the 1x1 matrix cell
+        for &(s, t) in &[(0u32, 3u32), (3, 0), (1, 2)] {
+            let expected = distance_matrix(&cv, &mv, &[s], &[t])[0];
+            assert_eq!(distance(&cv, &mv, s, t), expected);
+        }
+        // self-distance is zero
+        assert_eq!(distance(&cv, &mv, 2, 2), 0);
+
+        // reverse direction has no arcs in the fixture -> unreachable.
+        assert_eq!(distance(&cv, &mv, 3, 0), INF_WEIGHT);
+    }
+
+    #[test]
+    fn distances_from_matches_matrix_row_and_handles_empty() {
+        let (cch, metric) = build_query_fixture();
+        let cv = cch.view();
+        let mv = metric.view();
+
+        let targets = [0u32, 1, 2, 3];
+        let expected = distance_matrix(&cv, &mv, &[0], &targets); // single-source row
+        assert_eq!(distances_from(&cv, &mv, 0, &targets), expected);
+        assert_eq!(distances_from(&cv, &mv, 0, &targets).len(), targets.len());
+
+        // empty targets -> empty vec (matches distance_matrix)
+        assert!(distances_from(&cv, &mv, 0, &[]).is_empty());
     }
 }
