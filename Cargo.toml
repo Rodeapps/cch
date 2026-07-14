@@ -1,6 +1,6 @@
 [package]
 name = "cch"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2024"
 license = "MIT"
 description = "Pure-Rust Customizable Contraction Hierarchies (CCH): build, customize in parallel, and serve fast shortest-path distance, many-to-many matrix, and path queries on road networks"
@@ -28,6 +28,10 @@ criterion = { version = "0.5", features = ["html_reports"] }
 
 [[bench]]
 name = "cch"
+harness = false
+
+[[bench]]
+name = "real_corpus"
 harness = false
 
 [lints.clippy]
