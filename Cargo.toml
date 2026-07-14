@@ -30,6 +30,10 @@ criterion = { version = "0.5", features = ["html_reports"] }
 name = "cch"
 harness = false
 
+[[bench]]
+name = "real_corpus"
+harness = false
+
 [lints.clippy]
 all = "deny"
 pedantic = "warn"
