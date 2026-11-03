@@ -266,48 +266,74 @@ fn build_input_arc_mapping(
 ) -> InputArcMapping {
     let input_arc_count = orig_tail.len();
     let cch_arc_count = up_head.len();
+    let input_arc_ids = 0..u32::try_from(input_arc_count).expect("input arc count fits u32");
+    let input_arcs = || orig_tail.iter().copied().zip(orig_head.iter().copied());
 
     let mut input_arc_to_cch_arc = vec![INVALID_ID; input_arc_count];
     let mut forward_input_arc_of_cch = vec![INVALID_ID; cch_arc_count];
     let mut backward_input_arc_of_cch = vec![INVALID_ID; cch_arc_count];
+    let mut first_extra_forward_input_arc_of_cch = vec![0u32; cch_arc_count + 1];
+    let mut first_extra_backward_input_arc_of_cch = vec![0u32; cch_arc_count + 1];
 
-    // Per-CCH-arc accumulators for parallel (extra) input arcs.
-    let mut extra_forward: Vec<Vec<u32>> = vec![Vec::new(); cch_arc_count];
-    let mut extra_backward: Vec<Vec<u32>> = vec![Vec::new(); cch_arc_count];
-
-    for input_arc in 0..input_arc_count {
-        let t = orig_tail[input_arc];
-        let h = orig_head[input_arc];
-        if t == h {
-            continue; // self-loop → INVALID_ID (already initialized)
+    for (input_arc, (tail, head)) in input_arc_ids.clone().zip(input_arcs()) {
+        if tail == head {
+            continue;
         }
-        let upward = t < h;
-        let (lo, hi) = if upward { (t, h) } else { (h, t) };
-        let cch_arc = find_up_arc(up_first_out, up_head, lo, hi);
-        #[allow(
-            clippy::cast_possible_truncation,
-            reason = "input_arc < input_arc_count <= u32::MAX (CCH limit)"
-        )]
-        let input_arc_u32 = input_arc as u32;
-        input_arc_to_cch_arc[input_arc] = cch_arc;
-        let ci = cch_arc as usize;
-        if upward {
-            if forward_input_arc_of_cch[ci] == INVALID_ID {
-                forward_input_arc_of_cch[ci] = input_arc_u32;
-            } else {
-                extra_forward[ci].push(input_arc_u32);
-            }
-        } else if backward_input_arc_of_cch[ci] == INVALID_ID {
-            backward_input_arc_of_cch[ci] = input_arc_u32;
+
+        let cch_arc = find_up_arc(up_first_out, up_head, tail.min(head), tail.max(head));
+        input_arc_to_cch_arc[input_arc as usize] = cch_arc;
+        let (first, extra_count) = if tail < head {
+            (
+                &mut forward_input_arc_of_cch[cch_arc as usize],
+                &mut first_extra_forward_input_arc_of_cch[cch_arc as usize],
+            )
         } else {
-            extra_backward[ci].push(input_arc_u32);
+            (
+                &mut backward_input_arc_of_cch[cch_arc as usize],
+                &mut first_extra_backward_input_arc_of_cch[cch_arc as usize],
+            )
+        };
+
+        if *first == INVALID_ID {
+            *first = input_arc;
+        } else {
+            *extra_count += 1;
         }
     }
 
-    let (first_extra_forward_input_arc_of_cch, extra_forward_input_arc_of_cch) =
-        flatten_extra(&extra_forward);
-    let (first_extra_backward_input_arc_of_cch, extra_backward_input_arc_of_cch) =
-        flatten_extra(&extra_backward);
+    let mut extra_forward_input_arc_of_cch =
+        vec![0u32; inclusive_prefix_sum(&mut first_extra_forward_input_arc_of_cch) as usize];
+    let mut extra_backward_input_arc_of_cch =
+        vec![0u32; inclusive_prefix_sum(&mut first_extra_backward_input_arc_of_cch) as usize];
+
+    // Each offset now holds the end of its CCH arc's range. Filling the ranges
+    // from the end while walking the input arcs backwards keeps every range in
+    // ascending input-arc order and leaves each offset at the start of its range.
+    for (input_arc, (tail, head)) in input_arc_ids.rev().zip(input_arcs().rev()) {
+        if tail == head {
+            continue;
+        }
+
+        let cch_arc = input_arc_to_cch_arc[input_arc as usize] as usize;
+        let (first, first_extra, extra) = if tail < head {
+            (
+                forward_input_arc_of_cch[cch_arc],
+                &mut first_extra_forward_input_arc_of_cch,
+                &mut extra_forward_input_arc_of_cch,
+            )
+        } else {
+            (
+                backward_input_arc_of_cch[cch_arc],
+                &mut first_extra_backward_input_arc_of_cch,
+                &mut extra_backward_input_arc_of_cch,
+            )
+        };
+
+        if first != input_arc {
+            first_extra[cch_arc] -= 1;
+            extra[first_extra[cch_arc] as usize] = input_arc;
+        }
+    }
 
     InputArcMapping {
         input_arc_to_cch_arc,
@@ -339,24 +365,13 @@ fn find_up_arc(up_first_out: &[u32], up_head: &[u32], lo: u32, hi: u32) -> u32 {
     arc
 }
 
-/// Flattens a per-CCH-arc list of extra input arcs into a CSR pair
-/// `(first_out, flat)` where `flat[first_out[i]..first_out[i+1]]` are the extra
-/// input arcs of CCH arc `i`.
-fn flatten_extra(per_arc: &[Vec<u32>]) -> (Vec<u32>, Vec<u32>) {
-    let mut first_out = vec![0u32; per_arc.len() + 1];
-    for (i, list) in per_arc.iter().enumerate() {
-        #[allow(
-            clippy::cast_possible_truncation,
-            reason = "extra-arc count fits u32 (CCH limit)"
-        )]
-        let len = list.len() as u32;
-        first_out[i + 1] = first_out[i] + len;
-    }
-    let mut flat = Vec::with_capacity(first_out[per_arc.len()] as usize);
-    for list in per_arc {
-        flat.extend_from_slice(list);
-    }
-    (first_out, flat)
+/// Replaces each count with the sum of itself and all counts before it, and
+/// returns the total.
+fn inclusive_prefix_sum(counts: &mut [u32]) -> u32 {
+    counts.iter_mut().fold(0, |total, count| {
+        *count += total;
+        *count
+    })
 }
 
 /// Computes the (forward) stable sort permutation `p` that orders the arcs
