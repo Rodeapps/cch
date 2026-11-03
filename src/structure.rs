@@ -23,7 +23,8 @@
 //! 8. Down graph: `down_tail = up_head`, `down_head = up_tail`; the sort
 //!    permutation first-by-tail-then-by-head is `down_to_up`; apply it to
 //!    `down_head`; `down_first_out = invert_vector(down_tail, …)`
-//!    (lines 536–543).
+//!    (lines 536–543). One counting sort of `up_head` gives `down_to_up` and
+//!    `down_first_out` without copying the up-arcs.
 //!
 //! The `input_arc_to_cch_arc` / `is_input_arc_upward` mappings (C++ lines
 //! 325–376) and the filtering block (lines 452–528, skipped when
@@ -154,7 +155,7 @@ impl Cch {
         let (up_tail, up_head) = compute_chordal_supergraph(graph, &rank);
 
         // C++ line 314: up_first_out = invert_vector(up_tail, node_count).
-        let up_first_out = invert_vector(&up_tail, node_count);
+        let up_first_out = bucket_starts(&up_tail, node_count);
 
         // Part A — input-arc → CCH-arc mapping (C++ lines 325–376, 555–640).
         let mapping = build_input_arc_mapping(graph, &rank, &up_first_out, &up_head);
@@ -175,12 +176,11 @@ impl Cch {
         //                    down_tail, down_head)  (also sorts down_tail);
         //   down_head = apply_permutation(down_to_up, down_head);
         //   down_first_out = invert_vector(down_tail, node_count);
-        let mut down_tail = up_head.clone();
-        let down_head_unsorted = up_tail.clone();
-        let down_to_up =
-            compute_sort_perm_by_tail_then_head(node_count, &mut down_tail, &down_head_unsorted);
-        let down_head = apply_permutation(&down_to_up, &down_head_unsorted);
-        let down_first_out = invert_vector(&down_tail, node_count);
+        // The up-arcs are sorted by up_tail, so a stable sort by up_head alone
+        // orders them first by up_head, then by up_tail.
+        let down_to_up = stable_sort_perm_by_key(&up_head, node_count);
+        let down_head = apply_permutation(&down_to_up, &up_tail);
+        let down_first_out = bucket_starts(&up_head, node_count);
 
         Cch {
             rank,
@@ -364,51 +364,15 @@ fn inclusive_prefix_sum(counts: &mut [u32]) -> u32 {
     })
 }
 
-/// Computes the (forward) stable sort permutation `p` that orders the arcs
-/// `(tail, head)` first by `tail` then by `head`, such that the sorted arrays
-/// are `tail[p[i]]`, `head[p[i]]`. `tail` is sorted in place (matching the
-/// C++ `…_and_apply_sort_to_tail` family, which sorts `a` in place and returns
-/// the sort permutation).
-///
-/// Equivalent to `compute_sort_permutation_first_by_tail_then_by_head_and_apply_sort_to_tail`
-/// (`graph_util.cpp:142`). Both `tail` and `head` are keys in `[0, node_count)`,
-/// so a stable two-pass bucket-style sort reproduces `RoutingKit`'s result
-/// exactly (its bucket sort is stable, and its comparator fallback uses
-/// `std::stable_sort`, which is also stable).
-fn compute_sort_perm_by_tail_then_head(
-    node_count: usize,
-    tail: &mut [u32],
-    head: &[u32],
-) -> Vec<u32> {
-    // p: stable sort by head (C++: compute_stable_sort_permutation_using_key(b)).
-    let p = stable_sort_perm_by_key(head, node_count);
-    // a' = apply_permutation(p, a) (the tail reordered by p).
-    let tail_by_p: Vec<u32> = p.iter().map(|&i| tail[i as usize]).collect();
-    // q: stable sort of a' by key (C++: compute_stable_sort_permutation_using_key).
-    let q = stable_sort_perm_by_key(&tail_by_p, node_count);
-    // result = chain_permutation_first_left_then_right(p, q) → r[i] = p[q[i]].
-    let r: Vec<u32> = q.iter().map(|&qi| p[qi as usize]).collect();
-    // Sort `tail` in place using the resulting permutation.
-    let sorted_tail: Vec<u32> = r.iter().map(|&i| tail[i as usize]).collect();
-    tail.copy_from_slice(&sorted_tail);
-    r
-}
-
 /// Stable sort permutation by a single key in `[0, key_count)`: returns `p`
 /// such that `v[p[0]] <= v[p[1]] <= …` with ties broken by original index.
 ///
 /// Reproduces `compute_stable_sort_permutation_using_key` (counting/bucket
 /// sort, always stable).
 fn stable_sort_perm_by_key(v: &[u32], key_count: usize) -> Vec<u32> {
-    // Counting sort: prefix sums give each bucket's start; ascending iteration
-    // preserves the original relative order within a bucket (stable).
-    let mut bucket_pos = vec![0u32; key_count + 1];
-    for &k in v {
-        bucket_pos[k as usize + 1] += 1;
-    }
-    for i in 0..key_count {
-        bucket_pos[i + 1] += bucket_pos[i];
-    }
+    // Counting sort: ascending iteration preserves the original relative order
+    // within a bucket (stable).
+    let mut bucket_pos = bucket_starts(v, key_count);
     let mut p = vec![0u32; v.len()];
     for (i, &k) in v.iter().enumerate() {
         let pos = bucket_pos[k as usize] as usize;
@@ -520,26 +484,19 @@ fn push_unique(out: &mut Vec<u32>, value: u32) {
     }
 }
 
-/// CSR row-pointer construction from a sorted `tail` array. Returns a vector of
-/// length `element_count + 1` where entry `i` is the index of the first arc
-/// whose tail is `>= i`, and the last entry is `tail.len()`.
-///
-/// Faithful port of `invert_vector` (`inverse_vector.h:20–40`). `tail` must be
-/// sorted ascending.
-fn invert_vector(tail: &[u32], element_count: usize) -> Vec<u32> {
-    let mut index = vec![0u32; element_count + 1];
-    if tail.is_empty() {
-        return index;
+/// CSR row pointers of `keys` grouped by key: entry `k` is the number of keys
+/// below `k`, and the last entry is `keys.len()`. For a sorted `tail` array this
+/// is `invert_vector` (`inverse_vector.h:20–40`).
+fn bucket_starts(keys: &[u32], key_count: usize) -> Vec<u32> {
+    let mut starts = vec![0u32; key_count + 1];
+
+    for &key in keys {
+        starts[key as usize + 1] += 1;
     }
-    let mut pos = 0usize;
-    for (i, slot) in index.iter_mut().take(element_count).enumerate() {
-        while pos < tail.len() && (tail[pos] as usize) < i {
-            pos += 1;
-        }
-        *slot = u32::try_from(pos).expect("arc index fits u32");
-    }
-    index[element_count] = u32::try_from(tail.len()).expect("arc count fits u32");
-    index
+
+    inclusive_prefix_sum(&mut starts);
+
+    starts
 }
 
 #[cfg(test)]
@@ -674,15 +631,16 @@ mod tests {
     // Unit tests for the small helpers (edge paths).
     // ------------------------------------------------------------------
     #[test]
-    fn invert_vector_empty() {
-        assert_eq!(invert_vector(&[], 3), vec![0, 0, 0, 0]);
-        assert_eq!(invert_vector(&[], 0), vec![0]);
+    fn bucket_starts_empty() {
+        assert_eq!(bucket_starts(&[], 3), vec![0, 0, 0, 0]);
+        assert_eq!(bucket_starts(&[], 0), vec![0]);
     }
 
     #[test]
-    fn invert_vector_basic() {
+    fn bucket_starts_basic() {
         // tails [0,0,2] over 3 nodes → first_out [0,2,2,3].
-        assert_eq!(invert_vector(&[0, 0, 2], 3), vec![0, 2, 2, 3]);
+        assert_eq!(bucket_starts(&[0, 0, 2], 3), vec![0, 2, 2, 3]);
+        assert_eq!(bucket_starts(&[2, 0, 0], 3), vec![0, 2, 2, 3]);
     }
 
     #[test]
