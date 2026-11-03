@@ -15,7 +15,8 @@
 //! 5. Build the chordal supergraph by contracting nodes in rank order
 //!    (`compute_chordal_supergraph`, lines 26–57 / 289–300).
 //! 6. Sort the resulting up-arcs first-by-tail-then-by-head and build
-//!    `up_first_out` (lines 309–314).
+//!    `up_first_out` (lines 309–314). Step 5 emits them in that order, so no
+//!    sort runs.
 //! 7. `elimination_tree_parent[x] = up_head[up_first_out[x]]` or `INVALID_ID`
 //!    if `x` has no up-arcs (lines 390–396).
 //! 8. Down graph: `down_tail = up_head`, `down_head = up_tail`; the sort
@@ -170,13 +171,10 @@ impl Cch {
         // C++ lines 268–287: symmetrize, sort, drop duplicates + self-loops.
         let (sym_tail, sym_head) = symmetrize_and_dedup(node_count, &input_tail, &input_head);
 
-        // C++ lines 289–300: build chordal supergraph; the callback pushes
-        // up-arcs in contraction (rank) order.
-        let (mut up_tail, mut up_head) =
-            compute_chordal_supergraph(node_count, &sym_tail, &sym_head);
-
-        // C++ lines 309–312: sort up-arcs first-by-tail-then-by-head.
-        sort_by_tail_then_head(node_count, &mut up_tail, &mut up_head);
+        // C++ lines 289–312: build the chordal supergraph and sort its up-arcs
+        // first-by-tail-then-by-head. The arcs come out of the contraction in
+        // that order already, so the sort is the identity.
+        let (up_tail, up_head) = compute_chordal_supergraph(node_count, &sym_tail, &sym_head);
 
         // C++ line 314: up_first_out = invert_vector(up_tail, node_count).
         let up_first_out = invert_vector(&up_tail, node_count);
@@ -486,8 +484,8 @@ fn symmetrize_and_dedup(
 }
 
 /// Builds the chordal supergraph by contracting nodes in ascending rank order,
-/// invoking the equivalent of the C++ `on_new_arc(x, y)` callback for every
-/// up-arc generated, in the same order.
+/// and returns its up-arcs in the order of the C++ `on_new_arc(x, y)` callback:
+/// sorted by tail, then by head.
 ///
 /// Faithful port of `compute_chordal_supergraph`
 /// (`customizable_contraction_hierarchy.cpp:26–57`). The input `(tail, head)`
@@ -509,9 +507,6 @@ fn compute_chordal_supergraph(
         list.dedup();
     }
 
-    let mut up_tail = Vec::new();
-    let mut up_head = Vec::new();
-
     for n in 0..node_count {
         if nodes[n].is_empty() {
             continue;
@@ -524,14 +519,18 @@ fn compute_chordal_supergraph(
         // neighbor (C++ lines 45–49, std::merge + std::unique).
         let merged = merge_unique(&nodes[n][1..], &nodes[lowest_neighbor]);
         nodes[lowest_neighbor] = merged;
+    }
 
-        // Emit one up-arc (n -> neighbor) for each upward neighbor of n,
-        // in ascending neighbor order (C++ lines 51–53).
-        let tail_n = u32::try_from(n).expect("node id fits u32");
-        for &neighbor in &nodes[n] {
-            up_tail.push(tail_n);
-            up_head.push(neighbor);
-        }
+    // Contracting a node only changes the lists of higher nodes, so each list
+    // is final once its node is contracted. Emitting the up-arcs after the loop
+    // gives the C++ arc order (C++ lines 51–53) with an exact allocation.
+    let cch_arc_count = nodes.iter().map(Vec::len).sum();
+    let mut up_tail = Vec::with_capacity(cch_arc_count);
+    let mut up_head = Vec::with_capacity(cch_arc_count);
+
+    for (tail, neighbors) in (0u32..).zip(nodes) {
+        up_tail.extend(std::iter::repeat_n(tail, neighbors.len()));
+        up_head.extend(neighbors);
     }
 
     (up_tail, up_head)
