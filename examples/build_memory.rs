@@ -1,10 +1,11 @@
 //! Build the CCH of a bidirectional grid with a degree order, for measuring the
 //! peak memory of `Cch::build`. Every tenth arc gets a parallel copy, so the
-//! structure has extra input arcs.
+//! structure has extra input arcs. A degree order gives a grid a lot of
+//! fill-in: 200 x 200 nodes already give 58 million CCH arcs.
 //!
 //! ```text
 //! cargo build --release --example build_memory
-//! /usr/bin/time -l target/release/examples/build_memory 1000 1000
+//! /usr/bin/time -l target/release/examples/build_memory 200 200
 //! ```
 
 use cch::graph::Graph;
@@ -54,7 +55,7 @@ fn main() {
     let mut args = std::env::args()
         .skip(1)
         .map(|arg| arg.parse::<u32>().expect("grid size"));
-    let rows = args.next().unwrap_or(1000);
+    let rows = args.next().unwrap_or(200);
     let cols = args.next().unwrap_or(rows);
     let graph = grid(rows, cols);
     let order = degree_order(&graph);
