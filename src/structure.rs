@@ -11,17 +11,20 @@
 //! 2. Relabel input arc endpoints by `rank` (lines 228–229).
 //! 3. Sort input arcs first-by-tail-then-by-head (lines 243–246).
 //! 4. Symmetrize (append reversed arcs), sort, then drop duplicates and
-//!    self-loops (lines 268–287).
+//!    self-loops (lines 268–287). Steps 2 to 4 only feed the upward neighbour
+//!    lists of step 5, which are read from the graph without copying the arcs.
 //! 5. Build the chordal supergraph by contracting nodes in rank order
 //!    (`compute_chordal_supergraph`, lines 26–57 / 289–300).
 //! 6. Sort the resulting up-arcs first-by-tail-then-by-head and build
-//!    `up_first_out` (lines 309–314).
+//!    `up_first_out` (lines 309–314). Step 5 emits them in that order, so no
+//!    sort runs.
 //! 7. `elimination_tree_parent[x] = up_head[up_first_out[x]]` or `INVALID_ID`
 //!    if `x` has no up-arcs (lines 390–396).
 //! 8. Down graph: `down_tail = up_head`, `down_head = up_tail`; the sort
 //!    permutation first-by-tail-then-by-head is `down_to_up`; apply it to
 //!    `down_head`; `down_first_out = invert_vector(down_tail, …)`
-//!    (lines 536–543).
+//!    (lines 536–543). One counting sort of `up_head` gives `down_to_up` and
+//!    `down_first_out` without copying the up-arcs.
 //!
 //! The `input_arc_to_cch_arc` / `is_input_arc_upward` mappings (C++ lines
 //! 325–376) and the filtering block (lines 452–528, skipped when
@@ -145,44 +148,17 @@ impl Cch {
         // C++ line 215: rank = invert_permutation(order).
         let rank = inverse_permutation(order);
 
-        // Derive (tail, head) from the CSR graph, then relabel endpoints by
-        // rank (C++ lines 228–229: apply_permutation_to_elements_of(rank, …)).
-        // We keep the rank-relabeled endpoints in their ORIGINAL (input-arc-id)
-        // order in `orig_tail`/`orig_head` for the Part-A mapping, and a working
-        // copy `input_tail`/`input_head` that gets sorted for structure building.
-        let input_arc_count = graph.arc_count();
-        let mut orig_tail = Vec::with_capacity(input_arc_count);
-        let mut orig_head = Vec::with_capacity(input_arc_count);
-        for v in 0..node_count {
-            let start = graph.first_out[v] as usize;
-            let end = graph.first_out[v + 1] as usize;
-            for arc in start..end {
-                orig_tail.push(rank[v]);
-                orig_head.push(rank[graph.head[arc] as usize]);
-            }
-        }
-        let mut input_tail = orig_tail.clone();
-        let mut input_head = orig_head.clone();
-
-        // C++ lines 243–246: sort arcs first-by-tail-then-by-head.
-        sort_by_tail_then_head(node_count, &mut input_tail, &mut input_head);
-
-        // C++ lines 268–287: symmetrize, sort, drop duplicates + self-loops.
-        let (sym_tail, sym_head) = symmetrize_and_dedup(node_count, &input_tail, &input_head);
-
-        // C++ lines 289–300: build chordal supergraph; the callback pushes
-        // up-arcs in contraction (rank) order.
-        let (mut up_tail, mut up_head) =
-            compute_chordal_supergraph(node_count, &sym_tail, &sym_head);
-
-        // C++ lines 309–312: sort up-arcs first-by-tail-then-by-head.
-        sort_by_tail_then_head(node_count, &mut up_tail, &mut up_head);
+        // C++ lines 228–312: relabel, symmetrize and dedup the input arcs, build
+        // the chordal supergraph and sort its up-arcs first-by-tail-then-by-head.
+        // The arcs come out of the contraction in that order already, so the
+        // sort is the identity.
+        let (up_tail, up_head) = compute_chordal_supergraph(graph, &rank);
 
         // C++ line 314: up_first_out = invert_vector(up_tail, node_count).
-        let up_first_out = invert_vector(&up_tail, node_count);
+        let up_first_out = bucket_starts(&up_tail, node_count);
 
         // Part A — input-arc → CCH-arc mapping (C++ lines 325–376, 555–640).
-        let mapping = build_input_arc_mapping(&orig_tail, &orig_head, &up_first_out, &up_head);
+        let mapping = build_input_arc_mapping(graph, &rank, &up_first_out, &up_head);
 
         // C++ lines 390–396: elimination tree parent.
         let mut elimination_tree_parent = vec![0u32; node_count];
@@ -200,12 +176,11 @@ impl Cch {
         //                    down_tail, down_head)  (also sorts down_tail);
         //   down_head = apply_permutation(down_to_up, down_head);
         //   down_first_out = invert_vector(down_tail, node_count);
-        let mut down_tail = up_head.clone();
-        let down_head_unsorted = up_tail.clone();
-        let down_to_up =
-            compute_sort_perm_by_tail_then_head(node_count, &mut down_tail, &down_head_unsorted);
-        let down_head = apply_permutation(&down_to_up, &down_head_unsorted);
-        let down_first_out = invert_vector(&down_tail, node_count);
+        // The up-arcs are sorted by up_tail, so a stable sort by up_head alone
+        // orders them first by up_head, then by up_tail.
+        let down_to_up = stable_sort_perm_by_key(&up_head, node_count);
+        let down_head = apply_permutation(&down_to_up, &up_tail);
+        let down_first_out = bucket_starts(&up_head, node_count);
 
         Cch {
             rank,
@@ -241,9 +216,7 @@ struct InputArcMapping {
 
 /// Builds the input-arc → CCH-arc mapping (C++ lines 325–376 + 555–640).
 ///
-/// `orig_tail`/`orig_head` are the rank-relabeled input-arc endpoints in their
-/// ORIGINAL input-arc-id order. `up_first_out`/`up_head` describe the (sorted)
-/// CCH up-graph.
+/// `up_first_out`/`up_head` describe the (sorted) CCH up-graph.
 ///
 /// For each input arc with relabeled endpoints `(t, h)`:
 /// * `t == h` → self-loop → maps to [`INVALID_ID`] (C++ 351–353).
@@ -259,55 +232,81 @@ struct InputArcMapping {
 /// 580–596; the inverse-permutation reordering at 603–636 merely groups the
 /// extra lists by CCH arc, which the CSR layout built here reproduces directly.
 fn build_input_arc_mapping(
-    orig_tail: &[u32],
-    orig_head: &[u32],
+    graph: &Graph,
+    rank: &[u32],
     up_first_out: &[u32],
     up_head: &[u32],
 ) -> InputArcMapping {
-    let input_arc_count = orig_tail.len();
+    let input_arc_count = graph.arc_count();
     let cch_arc_count = up_head.len();
+    let input_arc_ids = 0..u32::try_from(input_arc_count).expect("input arc count fits u32");
+    let input_arcs = || ranked_arcs(graph, rank);
 
     let mut input_arc_to_cch_arc = vec![INVALID_ID; input_arc_count];
     let mut forward_input_arc_of_cch = vec![INVALID_ID; cch_arc_count];
     let mut backward_input_arc_of_cch = vec![INVALID_ID; cch_arc_count];
+    let mut first_extra_forward_input_arc_of_cch = vec![0u32; cch_arc_count + 1];
+    let mut first_extra_backward_input_arc_of_cch = vec![0u32; cch_arc_count + 1];
 
-    // Per-CCH-arc accumulators for parallel (extra) input arcs.
-    let mut extra_forward: Vec<Vec<u32>> = vec![Vec::new(); cch_arc_count];
-    let mut extra_backward: Vec<Vec<u32>> = vec![Vec::new(); cch_arc_count];
-
-    for input_arc in 0..input_arc_count {
-        let t = orig_tail[input_arc];
-        let h = orig_head[input_arc];
-        if t == h {
-            continue; // self-loop → INVALID_ID (already initialized)
+    for (input_arc, (tail, head)) in input_arc_ids.clone().zip(input_arcs()) {
+        if tail == head {
+            continue;
         }
-        let upward = t < h;
-        let (lo, hi) = if upward { (t, h) } else { (h, t) };
-        let cch_arc = find_up_arc(up_first_out, up_head, lo, hi);
-        #[allow(
-            clippy::cast_possible_truncation,
-            reason = "input_arc < input_arc_count <= u32::MAX (CCH limit)"
-        )]
-        let input_arc_u32 = input_arc as u32;
-        input_arc_to_cch_arc[input_arc] = cch_arc;
-        let ci = cch_arc as usize;
-        if upward {
-            if forward_input_arc_of_cch[ci] == INVALID_ID {
-                forward_input_arc_of_cch[ci] = input_arc_u32;
-            } else {
-                extra_forward[ci].push(input_arc_u32);
-            }
-        } else if backward_input_arc_of_cch[ci] == INVALID_ID {
-            backward_input_arc_of_cch[ci] = input_arc_u32;
+
+        let cch_arc = find_up_arc(up_first_out, up_head, tail.min(head), tail.max(head));
+        input_arc_to_cch_arc[input_arc as usize] = cch_arc;
+        let (first, extra_count) = if tail < head {
+            (
+                &mut forward_input_arc_of_cch[cch_arc as usize],
+                &mut first_extra_forward_input_arc_of_cch[cch_arc as usize],
+            )
         } else {
-            extra_backward[ci].push(input_arc_u32);
+            (
+                &mut backward_input_arc_of_cch[cch_arc as usize],
+                &mut first_extra_backward_input_arc_of_cch[cch_arc as usize],
+            )
+        };
+
+        if *first == INVALID_ID {
+            *first = input_arc;
+        } else {
+            *extra_count += 1;
         }
     }
 
-    let (first_extra_forward_input_arc_of_cch, extra_forward_input_arc_of_cch) =
-        flatten_extra(&extra_forward);
-    let (first_extra_backward_input_arc_of_cch, extra_backward_input_arc_of_cch) =
-        flatten_extra(&extra_backward);
+    let mut extra_forward_input_arc_of_cch =
+        vec![0u32; inclusive_prefix_sum(&mut first_extra_forward_input_arc_of_cch) as usize];
+    let mut extra_backward_input_arc_of_cch =
+        vec![0u32; inclusive_prefix_sum(&mut first_extra_backward_input_arc_of_cch) as usize];
+
+    // Each offset now holds the end of its CCH arc's range. Filling the ranges
+    // from the end while walking the input arcs backwards keeps every range in
+    // ascending input-arc order and leaves each offset at the start of its range.
+    for (input_arc, (tail, head)) in input_arc_ids.rev().zip(input_arcs().rev()) {
+        if tail == head {
+            continue;
+        }
+
+        let cch_arc = input_arc_to_cch_arc[input_arc as usize] as usize;
+        let (first, first_extra, extra) = if tail < head {
+            (
+                forward_input_arc_of_cch[cch_arc],
+                &mut first_extra_forward_input_arc_of_cch,
+                &mut extra_forward_input_arc_of_cch,
+            )
+        } else {
+            (
+                backward_input_arc_of_cch[cch_arc],
+                &mut first_extra_backward_input_arc_of_cch,
+                &mut extra_backward_input_arc_of_cch,
+            )
+        };
+
+        if first != input_arc {
+            first_extra[cch_arc] -= 1;
+            extra[first_extra[cch_arc] as usize] = input_arc;
+        }
+    }
 
     InputArcMapping {
         input_arc_to_cch_arc,
@@ -318,6 +317,23 @@ fn build_input_arc_mapping(
         first_extra_backward_input_arc_of_cch,
         extra_backward_input_arc_of_cch,
     }
+}
+
+/// The input arcs in arc-id order, with both endpoints relabeled by `rank`
+/// (C++ lines 228–229).
+fn ranked_arcs<'a>(
+    graph: &'a Graph,
+    rank: &'a [u32],
+) -> impl DoubleEndedIterator<Item = (u32, u32)> + 'a {
+    graph
+        .first_out
+        .windows(2)
+        .zip(rank)
+        .flat_map(move |(arcs, &tail)| {
+            graph.head[arcs[0] as usize..arcs[1] as usize]
+                .iter()
+                .map(move |&head| (tail, rank[head as usize]))
+        })
 }
 
 /// Finds the up-arc id with tail `lo` and head `hi`. The up-arcs of tail `lo`
@@ -339,66 +355,13 @@ fn find_up_arc(up_first_out: &[u32], up_head: &[u32], lo: u32, hi: u32) -> u32 {
     arc
 }
 
-/// Flattens a per-CCH-arc list of extra input arcs into a CSR pair
-/// `(first_out, flat)` where `flat[first_out[i]..first_out[i+1]]` are the extra
-/// input arcs of CCH arc `i`.
-fn flatten_extra(per_arc: &[Vec<u32>]) -> (Vec<u32>, Vec<u32>) {
-    let mut first_out = vec![0u32; per_arc.len() + 1];
-    for (i, list) in per_arc.iter().enumerate() {
-        #[allow(
-            clippy::cast_possible_truncation,
-            reason = "extra-arc count fits u32 (CCH limit)"
-        )]
-        let len = list.len() as u32;
-        first_out[i + 1] = first_out[i] + len;
-    }
-    let mut flat = Vec::with_capacity(first_out[per_arc.len()] as usize);
-    for list in per_arc {
-        flat.extend_from_slice(list);
-    }
-    (first_out, flat)
-}
-
-/// Computes the (forward) stable sort permutation `p` that orders the arcs
-/// `(tail, head)` first by `tail` then by `head`, such that the sorted arrays
-/// are `tail[p[i]]`, `head[p[i]]`. `tail` is sorted in place (matching the
-/// C++ `…_and_apply_sort_to_tail` family, which sorts `a` in place and returns
-/// the sort permutation).
-///
-/// Equivalent to `compute_sort_permutation_first_by_tail_then_by_head_and_apply_sort_to_tail`
-/// (`graph_util.cpp:142`). Both `tail` and `head` are keys in `[0, node_count)`,
-/// so a stable two-pass bucket-style sort reproduces `RoutingKit`'s result
-/// exactly (its bucket sort is stable, and its comparator fallback uses
-/// `std::stable_sort`, which is also stable).
-fn compute_sort_perm_by_tail_then_head(
-    node_count: usize,
-    tail: &mut [u32],
-    head: &[u32],
-) -> Vec<u32> {
-    // p: stable sort by head (C++: compute_stable_sort_permutation_using_key(b)).
-    let p = stable_sort_perm_by_key(head, node_count);
-    // a' = apply_permutation(p, a) (the tail reordered by p).
-    let tail_by_p: Vec<u32> = p.iter().map(|&i| tail[i as usize]).collect();
-    // q: stable sort of a' by key (C++: compute_stable_sort_permutation_using_key).
-    let q = stable_sort_perm_by_key(&tail_by_p, node_count);
-    // result = chain_permutation_first_left_then_right(p, q) → r[i] = p[q[i]].
-    let r: Vec<u32> = q.iter().map(|&qi| p[qi as usize]).collect();
-    // Sort `tail` in place using the resulting permutation.
-    let sorted_tail: Vec<u32> = r.iter().map(|&i| tail[i as usize]).collect();
-    tail.copy_from_slice(&sorted_tail);
-    r
-}
-
-/// Sorts `(tail, head)` first by tail then by head, in place. The permutation
-/// itself is not needed by the caller (the C++ uses the inverse-sort variant
-/// here, but the *sorted arrays* are identical regardless of which sort
-/// variant is used).
-fn sort_by_tail_then_head(node_count: usize, tail: &mut Vec<u32>, head: &mut Vec<u32>) {
-    let mut t = std::mem::take(tail);
-    let p = compute_sort_perm_by_tail_then_head(node_count, &mut t, head);
-    let sorted_head: Vec<u32> = p.iter().map(|&i| head[i as usize]).collect();
-    *tail = t;
-    *head = sorted_head;
+/// Replaces each count with the sum of itself and all counts before it, and
+/// returns the total.
+fn inclusive_prefix_sum(counts: &mut [u32]) -> u32 {
+    counts.iter_mut().fold(0, |total, count| {
+        *count += total;
+        *count
+    })
 }
 
 /// Stable sort permutation by a single key in `[0, key_count)`: returns `p`
@@ -407,15 +370,9 @@ fn sort_by_tail_then_head(node_count: usize, tail: &mut Vec<u32>, head: &mut Vec
 /// Reproduces `compute_stable_sort_permutation_using_key` (counting/bucket
 /// sort, always stable).
 fn stable_sort_perm_by_key(v: &[u32], key_count: usize) -> Vec<u32> {
-    // Counting sort: prefix sums give each bucket's start; ascending iteration
-    // preserves the original relative order within a bucket (stable).
-    let mut bucket_pos = vec![0u32; key_count + 1];
-    for &k in v {
-        bucket_pos[k as usize + 1] += 1;
-    }
-    for i in 0..key_count {
-        bucket_pos[i + 1] += bucket_pos[i];
-    }
+    // Counting sort: ascending iteration preserves the original relative order
+    // within a bucket (stable).
+    let mut bucket_pos = bucket_starts(v, key_count);
     let mut p = vec![0u32; v.len()];
     for (i, &k) in v.iter().enumerate() {
         let pos = bucket_pos[k as usize] as usize;
@@ -425,77 +382,36 @@ fn stable_sort_perm_by_key(v: &[u32], key_count: usize) -> Vec<u32> {
     p
 }
 
-/// Symmetrize the (already tail/head-sorted) input arcs by appending the
-/// reversed copy, re-sort, then drop duplicate arcs and self-loops.
-///
-/// Ports C++ lines 268–287. Returns `(symmetric_tail, symmetric_head)` after
-/// the `inplace_keep_element_of_vector_if(filter, …)` compaction.
-fn symmetrize_and_dedup(
-    node_count: usize,
-    input_tail: &[u32],
-    input_head: &[u32],
-) -> (Vec<u32>, Vec<u32>) {
-    let input_arc_count = input_tail.len();
-    let mut sym_tail = Vec::with_capacity(2 * input_arc_count);
-    let mut sym_head = Vec::with_capacity(2 * input_arc_count);
-    // First half: the original arcs.
-    sym_tail.extend_from_slice(input_tail);
-    sym_head.extend_from_slice(input_head);
-    // Second half: reversed arcs.
-    sym_tail.extend_from_slice(input_head);
-    sym_head.extend_from_slice(input_tail);
-
-    // Sort first-by-tail-then-by-head (C++ lines 276–278).
-    sort_by_tail_then_head(node_count, &mut sym_tail, &mut sym_head);
-
-    // Build the keep-filter (C++ lines 280–287):
-    //   keep[0]   = tail[0] != head[0]
-    //   keep[i>0] = (head[i] != head[i-1] || tail[i] != tail[i-1])  // not a dup
-    //               && (tail[i] != head[i])                         // not a loop
-    let total = sym_tail.len();
-    let mut kept_tail = Vec::with_capacity(total);
-    let mut kept_head = Vec::with_capacity(total);
-    if input_arc_count != 0 && sym_tail[0] != sym_head[0] {
-        kept_tail.push(sym_tail[0]);
-        kept_head.push(sym_head[0]);
-    }
-    for i in 1..total {
-        let not_dup = sym_head[i] != sym_head[i - 1] || sym_tail[i] != sym_tail[i - 1];
-        let not_loop = sym_tail[i] != sym_head[i];
-        if not_dup && not_loop {
-            kept_tail.push(sym_tail[i]);
-            kept_head.push(sym_head[i]);
-        }
-    }
-    (kept_tail, kept_head)
-}
-
 /// Builds the chordal supergraph by contracting nodes in ascending rank order,
-/// invoking the equivalent of the C++ `on_new_arc(x, y)` callback for every
-/// up-arc generated, in the same order.
+/// and returns its up-arcs in the order of the C++ `on_new_arc(x, y)` callback:
+/// sorted by tail, then by head.
 ///
 /// Faithful port of `compute_chordal_supergraph`
-/// (`customizable_contraction_hierarchy.cpp:26–57`). The input `(tail, head)`
-/// must be the symmetrized, deduped, loop-free arc set.
-fn compute_chordal_supergraph(
-    node_count: usize,
-    tail: &[u32],
-    head: &[u32],
-) -> (Vec<u32>, Vec<u32>) {
-    // nodes[n] = sorted, unique upward neighbors of n (only head > n kept).
-    let mut nodes: Vec<Vec<u32>> = vec![Vec::new(); node_count];
-    for i in 0..tail.len() {
-        if tail[i] < head[i] {
-            nodes[tail[i] as usize].push(head[i]);
-        }
+/// (`customizable_contraction_hierarchy.cpp:26–57`). Its input in the C++ is
+/// the symmetrized, deduped, loop-free set of rank-relabeled input arcs (lines
+/// 228–287). The upward neighbours of a node in that set are the higher
+/// endpoints of its non-loop input arcs, so they are read straight from the
+/// graph.
+fn compute_chordal_supergraph(graph: &Graph, rank: &[u32]) -> (Vec<u32>, Vec<u32>) {
+    let node_count = rank.len();
+    let non_loop_arcs = || ranked_arcs(graph, rank).filter(|(tail, head)| tail != head);
+    let mut degree = vec![0usize; node_count];
+
+    for (tail, head) in non_loop_arcs() {
+        degree[tail.min(head) as usize] += 1;
     }
+
+    // nodes[n] = sorted, unique upward neighbors of n.
+    let mut nodes: Vec<Vec<u32>> = degree.into_iter().map(Vec::with_capacity).collect();
+
+    for (tail, head) in non_loop_arcs() {
+        nodes[tail.min(head) as usize].push(tail.max(head));
+    }
+
     for list in &mut nodes {
         list.sort_unstable();
         list.dedup();
     }
-
-    let mut up_tail = Vec::new();
-    let mut up_head = Vec::new();
 
     for n in 0..node_count {
         if nodes[n].is_empty() {
@@ -509,14 +425,18 @@ fn compute_chordal_supergraph(
         // neighbor (C++ lines 45–49, std::merge + std::unique).
         let merged = merge_unique(&nodes[n][1..], &nodes[lowest_neighbor]);
         nodes[lowest_neighbor] = merged;
+    }
 
-        // Emit one up-arc (n -> neighbor) for each upward neighbor of n,
-        // in ascending neighbor order (C++ lines 51–53).
-        let tail_n = u32::try_from(n).expect("node id fits u32");
-        for &neighbor in &nodes[n] {
-            up_tail.push(tail_n);
-            up_head.push(neighbor);
-        }
+    // Contracting a node only changes the lists of higher nodes, so each list
+    // is final once its node is contracted. Emitting the up-arcs after the loop
+    // gives the C++ arc order (C++ lines 51–53) with an exact allocation.
+    let cch_arc_count = nodes.iter().map(Vec::len).sum();
+    let mut up_tail = Vec::with_capacity(cch_arc_count);
+    let mut up_head = Vec::with_capacity(cch_arc_count);
+
+    for (tail, neighbors) in (0u32..).zip(nodes) {
+        up_tail.extend(std::iter::repeat_n(tail, neighbors.len()));
+        up_head.extend(neighbors);
     }
 
     (up_tail, up_head)
@@ -564,26 +484,19 @@ fn push_unique(out: &mut Vec<u32>, value: u32) {
     }
 }
 
-/// CSR row-pointer construction from a sorted `tail` array. Returns a vector of
-/// length `element_count + 1` where entry `i` is the index of the first arc
-/// whose tail is `>= i`, and the last entry is `tail.len()`.
-///
-/// Faithful port of `invert_vector` (`inverse_vector.h:20–40`). `tail` must be
-/// sorted ascending.
-fn invert_vector(tail: &[u32], element_count: usize) -> Vec<u32> {
-    let mut index = vec![0u32; element_count + 1];
-    if tail.is_empty() {
-        return index;
+/// CSR row pointers of `keys` grouped by key: entry `k` is the number of keys
+/// below `k`, and the last entry is `keys.len()`. For a sorted `tail` array this
+/// is `invert_vector` (`inverse_vector.h:20–40`).
+fn bucket_starts(keys: &[u32], key_count: usize) -> Vec<u32> {
+    let mut starts = vec![0u32; key_count + 1];
+
+    for &key in keys {
+        starts[key as usize + 1] += 1;
     }
-    let mut pos = 0usize;
-    for (i, slot) in index.iter_mut().take(element_count).enumerate() {
-        while pos < tail.len() && (tail[pos] as usize) < i {
-            pos += 1;
-        }
-        *slot = u32::try_from(pos).expect("arc index fits u32");
-    }
-    index[element_count] = u32::try_from(tail.len()).expect("arc count fits u32");
-    index
+
+    inclusive_prefix_sum(&mut starts);
+
+    starts
 }
 
 #[cfg(test)]
@@ -718,15 +631,16 @@ mod tests {
     // Unit tests for the small helpers (edge paths).
     // ------------------------------------------------------------------
     #[test]
-    fn invert_vector_empty() {
-        assert_eq!(invert_vector(&[], 3), vec![0, 0, 0, 0]);
-        assert_eq!(invert_vector(&[], 0), vec![0]);
+    fn bucket_starts_empty() {
+        assert_eq!(bucket_starts(&[], 3), vec![0, 0, 0, 0]);
+        assert_eq!(bucket_starts(&[], 0), vec![0]);
     }
 
     #[test]
-    fn invert_vector_basic() {
+    fn bucket_starts_basic() {
         // tails [0,0,2] over 3 nodes → first_out [0,2,2,3].
-        assert_eq!(invert_vector(&[0, 0, 2], 3), vec![0, 2, 2, 3]);
+        assert_eq!(bucket_starts(&[0, 0, 2], 3), vec![0, 2, 2, 3]);
+        assert_eq!(bucket_starts(&[2, 0, 0], 3), vec![0, 2, 2, 3]);
     }
 
     #[test]
@@ -742,14 +656,5 @@ mod tests {
         // keys: [2,0,1,0] over key_count 3 → stable order of indices:
         // bucket0: indices 1,3 ; bucket1: index 2 ; bucket2: index 0.
         assert_eq!(stable_sort_perm_by_key(&[2, 0, 1, 0], 3), vec![1, 3, 2, 0]);
-    }
-
-    #[test]
-    fn sort_by_tail_then_head_basic() {
-        let mut tail = vec![2u32, 0, 2, 0];
-        let mut head = vec![1u32, 3, 0, 1];
-        sort_by_tail_then_head(4, &mut tail, &mut head);
-        assert_eq!(tail, vec![0, 0, 2, 2]);
-        assert_eq!(head, vec![1, 3, 0, 1]);
     }
 }
