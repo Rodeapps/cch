@@ -1330,3 +1330,96 @@ fn inertial_order_determinism() {
     assert_eq!(a, b, "inertial_order not deterministic (run 1 vs 2)");
     assert_eq!(b, c, "inertial_order not deterministic (run 2 vs 3)");
 }
+
+// ----------------------------------------------------------------------------
+// Seeded random multigraphs with parallel arcs and self-loops. The whole
+// `Cch`, the input-arc mapping and the extra-arc lists included, must equal the
+// structure the oracle writes.
+// ----------------------------------------------------------------------------
+
+/// A linear congruential generator, so the fixtures need no extra dependency.
+struct Lcg(u64);
+
+impl Lcg {
+    fn below(&mut self, bound: u32) -> u32 {
+        self.0 = self
+            .0
+            .wrapping_mul(6_364_136_223_846_793_005)
+            .wrapping_add(1_442_695_040_888_963_407);
+
+        u32::try_from((self.0 >> 33) % u64::from(bound)).expect("value below a u32 bound")
+    }
+}
+
+/// Arcs sorted by tail, so the input-arc ids of the oracle and of the CSR
+/// graph agree, and a random contraction order.
+#[allow(
+    clippy::cast_possible_truncation,
+    reason = "fixture sizes are far below u32::MAX"
+)]
+fn random_multigraph(seed: u64) -> (u32, Vec<u32>, Vec<u32>, Vec<u32>) {
+    let mut random = Lcg(seed);
+    let node_count = 2 + random.below(40);
+    let arc_count = random.below(4 * node_count);
+    let mut arcs: Vec<(u32, u32)> = Vec::new();
+
+    for _ in 0..arc_count {
+        let tail = random.below(node_count);
+        let arc = match random.below(10) {
+            0 => (tail, tail),
+            1..=3 if !arcs.is_empty() => {
+                let (earlier_tail, earlier_head) = arcs[random.below(arcs.len() as u32) as usize];
+
+                if random.below(2) == 0 {
+                    (earlier_tail, earlier_head)
+                } else {
+                    (earlier_head, earlier_tail)
+                }
+            }
+            _ => (tail, random.below(node_count)),
+        };
+        arcs.push(arc);
+    }
+
+    arcs.sort_by_key(|&(tail, _)| tail);
+    let mut order: Vec<u32> = (0..node_count).collect();
+
+    for i in (1..order.len()).rev() {
+        order.swap(i, random.below(i as u32 + 1) as usize);
+    }
+
+    let (tail, head) = arcs.into_iter().unzip();
+
+    (node_count, tail, head, order)
+}
+
+#[test]
+fn random_multigraphs_match_oracle_struct() {
+    let mut saw_forward_extra = false;
+    let mut saw_backward_extra = false;
+
+    for seed in 0..200 {
+        let (node_count, tail, head, order) = random_multigraph(seed);
+        let oracle = unsafe { ffi::cch_new(&order, &tail, &head, |_| {}, false) };
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("random.cch-struct");
+        unsafe {
+            ffi::cch_save_struct(
+                oracle.as_ref().expect("cch_new returned null"),
+                path.to_str().unwrap(),
+            )
+            .expect("cch_save_struct");
+        }
+        let expected = Cch::load_struct(&path).expect("Cch::load_struct on oracle file");
+        let built = Cch::build(&csr_from_arcs(node_count, &tail, &head), &order);
+
+        assert_eq!(built, expected, "seed {seed}");
+        saw_forward_extra |= !built.extra_forward_input_arc_of_cch.is_empty();
+        saw_backward_extra |= !built.extra_backward_input_arc_of_cch.is_empty();
+    }
+
+    assert!(
+        saw_forward_extra && saw_backward_extra,
+        "fixtures must have extra input arcs"
+    );
+}
